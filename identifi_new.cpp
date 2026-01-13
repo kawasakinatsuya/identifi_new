@@ -85,9 +85,6 @@ public:
     // 高さのしきい値（障害物・坂道の判定で使用）
     this->declare_parameter("height_threshold", 0.1);
 
-    // 角度のしきい値（坂道と障害物の境界となる角度）
-    this->declare_parameter("angle_slo_obs", 30.0);
-
     // 角度のしきい値（平地と坂道の境界となる角度）
     this->declare_parameter("angle_fla_slo", 10.0);
 
@@ -106,10 +103,8 @@ public:
     this->declare_parameter("theta_max", 25.0);
     //点の高さで草・障害物の分類
     this->declare_parameter("h_undergrowth", 0.05);
-    this->declare_parameter("h_obs", 0.10);
+    this->declare_parameter("h_obs", 0.20);
 
-    // 近傍点を見つけるために半径何m以内を探索するか指定（法線ベクトル推定で使用）
-    this->declare_parameter("radius", 0.20);
     // 周辺のセル何マスと比較するか指定（1なら周囲8マス、2なら周囲24マス）
     this->declare_parameter("check_range", 1);
   }
@@ -206,6 +201,7 @@ private:
   void build_grid(const pcl::PointCloud<pcl::PointXYZ>& cloud_world, std::map<std::pair<int, int>, Cell>& cells, double bx, double by, double cell_size)
   {
     cells.clear();
+    int max_count = 0;
     for(int i = 0; i < static_cast<int>(cloud_world.points.size()); ++i){
       const auto& ptw =cloud_world.points[i];
       const float xl = static_cast<float>(ptw.x - bx);
@@ -229,13 +225,16 @@ private:
       cell.count ++;
       cell.pc_indices.push_back(i);
       cell.points_z.push_back(zl);
+      if(cell.count > max_count){
+        max_count = cell.count;
+      }
     }
-
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,"max_count=%d", max_count);    
   }
 
   double percentile(std::vector<float> samples, double per_num)
   {
-    if(samples.sie() == 0){
+    if(samples.size() == 0){
       return std::numeric_limits<double>::quiet_NaN();
     }
     int n = static_cast<int>(samples.size());
@@ -249,21 +248,20 @@ private:
 
   void detect_obstacle_slope(std::map<std::pair<int, int>, Cell>& cells, double cell_size)
   {
-    const int min_pts = this->get_parameter("min_points_per_celll").as_int();
-    const int max_pts = this->get_parameter("max_points_per_celll").as_int();
+    const int min_pts = this->get_parameter("min_points_per_cell").as_int();
+    const int max_pts = this->get_parameter("max_points_per_cell").as_int();
     const double per_gro = this->get_parameter("ground_percentile").as_double();
     const double per_rou = this->get_parameter("rough_percentile").as_double();
     const double rough_ground_max = this->get_parameter("rough_ground_max").as_double();
     const double conf_min = this->get_parameter("conf_min").as_double();
-    const double step_thr = this->get_parameter("step_thr").as_double();
+    //const double step_thr = this->get_parameter("step_thr").as_double();
     const double theta_max = this->get_parameter("theta_max").as_double();
     const double angle_fla_slo = this->get_parameter("angle_fla_slo").as_double();
-    const double check_range = this->get_parameter("check_range").as_int();
+    const int check_range = this->get_parameter("check_range").as_int();
 
-    bool z_min_valid;
-    bool z_max_valid;
     double max_ratio = static_cast<double>(max_pts) / static_cast<double>(min_pts); 
     std::deque<std::pair<int,int>> q;
+    const double PI = 3.14159265358979323846;
 
     for (auto& kv : cells){
       auto& c = kv.second;
@@ -280,7 +278,7 @@ private:
       c.roughness = c.z_rou_per - c.z_gro_per;
 
       if(c.roughness < rough_ground_max){
-        double ratio_pts = static_cast<double>(c.count) / static_castt<double>(min_pts)
+        double ratio_pts = static_cast<double>(c.count) / static_cast<double>(min_pts);
         c.ground_candidate = true;
         double pts_score = ratio_pts / max_ratio;
         double rou_score = 1.0 - (c.roughness / rough_ground_max);
@@ -316,8 +314,8 @@ private:
           continue;
         }
         double z_up_next = next_info.z_gro_per;
-        double allow_h = std::tan(theta_max) * cell_size;
-        if(std::obs(z_up_base - z_up_next) <= allow_h){
+        double allow_h = std::tan(theta_max * PI / 180) * cell_size;
+        if(std::abs(z_up_base - z_up_next) <= allow_h){
           next_info.detern_ground = true;
           q.push_back(next_key);
         }
@@ -328,18 +326,20 @@ private:
       auto& c = kv.second;
       if(c.detern_ground){
         c.ground_z = c.z_gro_per;
+        continue;
       }
-      double best = std::numeric_limits<double>::infnity();
+      double best = std::numeric_limits<double>::infinity();
       double best_z = std::numeric_limits<double>::quiet_NaN();
       for(int dy = -check_range; dy <= check_range; dy++){
         for(int dx = -check_range; dx <= check_range; dx++){
           if(dx == 0 && dy == 0){
             continue;
           }
-          if(cells.find(c.ix + dx, c.iy + dy) == cells.end()){
+          auto it = cells.find({c.ix + dx, c.iy + dy}) ;
+          if(it == cells.end()){
             continue;
           }
-          Cell& next_info = cells.find(c.ix + dx, c.iy + dy)->second;
+          Cell& next_info = it->second;
           if(!std::isfinite(next_info.ground_z)){
             continue;
           }
@@ -351,7 +351,7 @@ private:
         }
       }
       if(std::isfinite(best_z)){
-        c.ground__z = best_z;
+        c.ground_z = best_z;
       }
       else{
         c.unknown = true;
@@ -369,8 +369,8 @@ private:
       bool yminus_cell = false;
       double xplus_z, xminus_z, yplus_z, yminus_z;
 
-      for(k = 0; k < 4; k++){
-        std::pair<int, int> compare_key(ix + dx[k], iy + dy[k]);
+      for(int k = 0; k < 4; k++){
+        std::pair<int, int> compare_key{c.ix + dx[k], c.iy + dy[k]};
         if(cells.find(compare_key) == cells.end()){
           continue;
         }
@@ -386,15 +386,15 @@ private:
           xplus_z = next_cell.ground_z;
         }
         if(k == 1){
-          xminus_cell == true;
+          xminus_cell = true;
           xminus_z = next_cell.ground_z;
         }
         if(k == 2){
-          yplus_cell == true;
+          yplus_cell = true;
           yplus_z = next_cell.ground_z;
         }
         if(k == 3){
-          yminus_cell == true;
+          yminus_cell = true;
           yminus_z = next_cell.ground_z;
         }
       }
@@ -406,7 +406,7 @@ private:
       if(yplus_cell && yminus_cell){
         dzdy = (yplus_z - yminus_z) / (2.0 * cell_size);
       }
-      double angle = std::atan(std::sqrt(dzdx * dzdx + dzdy * dzdy)) * (180.0 / M_PI);
+      double angle = std::atan(std::sqrt(dzdx * dzdx + dzdy * dzdy)) * (180.0 / PI);
       if(angle > angle_fla_slo){
         c.slope = true;
       }
@@ -427,33 +427,31 @@ private:
     slope->points.reserve(d_map->points.size() / 2);
     for(auto& kv : cells){
       auto& c = kv.second;
-      uint8_t r = 0;
-      uint8_t g = 255;
-      uint8_t b = 0;
       for(auto& indx : c.pc_indices){
         auto& pt = d_map->points[indx];
-        unit8_t r = 0;
-        unit8_t g = 255;
-        unit8_t b = 0;
+        uint8_t r = 0;
+        uint8_t g = 255;
+        uint8_t b = 0;
         if(c.unknown || !std::isfinite(c.ground_z)){
           r = 255;
           g = 140;
           b = 0;
-          around_unknowm->pointss.push_back(pt); 
+          around_unknown->points.push_back(pt); 
         }
         else{
-          double h_diff = (duoble)pt.z - c.ground_z;
-          if(h > h_obs){
+          double h_diff = (double)pt.z - c.ground_z;
+          if(h_diff > h_obs){
             r = 255;
             g = 0;
             b = 0;
             obstacle->points.push_back(pt);
           }
-          else if(h > h_undergrowth){
+          else if(h_diff > h_undergrowth){
             //yellow
             r = 255;
             g = 255;
             b = 0;
+            undergrowth->points.push_back(pt);
           }
           else if(c.slope){
             r = 0;
@@ -483,7 +481,10 @@ private:
     slope -> height = 1;
     around_unknown -> width = around_unknown -> points.size();
     around_unknown -> height = 1;
-
+    undergrowth -> width = undergrowth -> points.size();
+    undergrowth -> height = 1;
+    ground -> width = ground -> points.size();
+    ground -> height = 1;
     
     sensor_msgs::msg::PointCloud2 col_msg, obs_msg, slo_msg, around_unknown_msg, ground_msg, undergrowth_msg;
     pcl::toROSMsg(*colored_pc, col_msg);
@@ -528,4 +529,3 @@ int main(int argc, char **argv)
   rclcpp::shutdown();
   return 0;
 }
-
