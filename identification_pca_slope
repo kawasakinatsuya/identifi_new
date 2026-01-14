@@ -42,7 +42,7 @@ struct Cell
     double z_rou_per = std::numeric_limits<double>::quiet_NaN();
     double ground_z = std::numeric_limits<double>::quiet_NaN();
     double roughness = std::numeric_limits<double>::quiet_NaN();
-    double Planarity = std::numeric_limits<double>::quiet_NaN();
+    double planarity = std::numeric_limits<double>::quiet_NaN();
     double scattering = std::numeric_limits<double>::quiet_NaN();
     Eigen::Vector3f normal = {0.0f, 0.0f, 0.0f};
     bool pca_on = false;
@@ -191,7 +191,7 @@ private:
     detect_obstacle_slope(cell_info, cell_size);
 
     //点群を出力するための関数
-    publish_result(*msg, ds_map, cell_info);
+    publish_result(*msg, ds_map, cell_info, bx, by, cell_size);
   }
 
   pcl::PointCloud<pcl::PointXYZ>::Ptr voxel_downsample(const pcl::PointCloud<pcl::PointXYZ>::Ptr& input, double vx_size)
@@ -434,19 +434,19 @@ private:
         dzdx = (xplus_z - c.ground_z) / cell_size;
       }
       else if(xminus_cell){
-        dzdx = (xminus_z - c.ground_z) / cell_size;
+        dzdx = (c.ground_z - xminus_z) / cell_size;
       }
       if(yplus_cell && yminus_cell){
         dzdy = (yplus_z - yminus_z) / (2.0 * cell_size);
       }
       else if(yplus_cell){
-        dzdx = (xplus_z - c.ground_z) / cell_size;
+        dzdy = (xplus_z - c.ground_z) / cell_size;
       }
       else if(yminus_cell){
-        dzdx = (yminus_z - c.ground_z) / cell_size;
+        dzdy = (c.ground_z - yminus_z) / cell_size;
       }
       c.dzdx = dzdx;
-      c.dzdy = dydx;
+      c.dzdy = dzdy;
       if(xplus_cell || xminus_cell || yplus_cell || yminus_cell){
         c.grad_on = true;
       }
@@ -476,7 +476,7 @@ private:
     double val3 = (double)eigenvalues(0);
     double val2 = (double)eigenvalues(1);
     double val1 = (double)eigenvalues(2);
-    cell_normal = evec.col(0).cast<float>();
+    cell_normal = eigenvectors.col(0).cast<float>();
     cell_normal.normalize();
 
     cell_planarity = (val2 - val3) / val1;
@@ -518,6 +518,9 @@ private:
           double h_diff = (double)pt.z - c.ground_z;
           if(c.slope && c.grad_on){
             const double xc = bx + (double)c.ix * cell_size + cell_size / 2.0;
+            const double yc = by + (double)c.iy * cell_size + cell_size / 2.0;
+            const double z_slo = c.ground_z + c.dzdx * (pt.x - xc) + c.dzdy * (pt.y - yc);
+            h_diff = (double)pt.z - z_slo;
           }
           if(h_diff > h_obs){
             r = 255;
@@ -526,7 +529,7 @@ private:
             obstacle->points.push_back(pt);
           }
           else if(h_diff > h_undergrowth){
-            if(c.pca_on && (c.planarity >= planatiry_min) && c.scattering <= scat_max){
+            if(c.pca_on && (c.planarity >= planarity_min) && c.scattering <= scattering_max){
               //乗り越え可能な障害物
               //紫色
               r = 255;
