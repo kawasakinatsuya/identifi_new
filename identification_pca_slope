@@ -440,7 +440,7 @@ private:
         dzdy = (yplus_z - yminus_z) / (2.0 * cell_size);
       }
       else if(yplus_cell){
-        dzdy = (xplus_z - c.ground_z) / cell_size;
+        dzdy = (yplus_z - c.ground_z) / cell_size;
       }
       else if(yminus_cell){
         dzdy = (c.ground_z - yminus_z) / cell_size;
@@ -485,6 +485,7 @@ private:
     if(std::isfinite(cell_planarity) && std::isfinite(cell_scattering)){
       return true;
     }
+    return false;
   }
 
   void publish_result(const sensor_msgs::msg::PointCloud2& in_msg, const pcl::PointCloud<pcl::PointXYZ>::Ptr& d_map, const std::map<std::pair<int, int>, Cell>& cells, double bx, double by, double cell_size){
@@ -529,7 +530,7 @@ private:
             obstacle->points.push_back(pt);
           }
           else if(h_diff > h_undergrowth){
-            if(c.pca_on && (c.planarity >= planarity_min) && c.scattering <= scattering_max){
+            if(c.pca_on && (c.planarity >= planarity_min) && (c.scattering <= scattering_max)){
               //乗り越え可能な障害物
               //紫色
               r = 255;
