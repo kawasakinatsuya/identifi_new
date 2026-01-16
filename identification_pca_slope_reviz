@@ -58,6 +58,12 @@ struct Cell
     double dzdx = 0.0;
     double dzdy = 0.0;
     bool grad_on = false;
+
+    Eigen::Vector3f ground_plane_n = {0.0f, 0.0f, 0.0f};
+    float ground_plane_d = 0.0f;
+    bool ground_plane_on = false;
+    int ground_plane_used_pts = 0;
+    double z_keep_ratio = 0.0;
 };
 
 struct TimeCloud
@@ -122,6 +128,14 @@ public:
     this->declare_parameter("pca_min_points", 15);
     this->declare_parameter("planarity_min", 0.4);
     this->declare_parameter("scattering_max", 0.20);
+
+    this->declare_parameter("z_keep_good", 0.60);
+    this->declare_parameter("z_keep_bad", 0.15);
+    this->declare_parameter("planarity_good", 0.55);
+    this->declare_parameter("scattering_good", 0.12);
+    this->declare_parameter("plane_fit_min_points", 12);
+    this->declare_parameter("normal_angle_max_deg", 15.0); 
+    this->declare_parameter("plane_z_err_max", 0.05); 
   }
 
 private:
@@ -486,6 +500,29 @@ private:
       return true;
     }
     return false;
+  }
+
+  bool select_low_z_indices(const pcl::PointCloud<pcl::PointXYZ>& cloud, const Cell& c, double keep_ratio, int min_keep_points, std::vector<int>& out_indices)
+  {
+    out_indices.clear();
+    if ((int)c.pc_indices.size() < min_keep_points) return false;
+    std::vector<float> zs = c.points_z;
+    if (zs.empty()) return false;
+    double z_th = percentile(zs, keep_ratio);
+    if (!std::isfinite(z_th)) return false;
+    for (size_t i = 0; i < c.pc_indices.size(); ++i) {
+        int idx = c.pc_indices[i];
+        const auto& pt = cloud.points[idx];
+        if (!std::isfinite(pt.z)) continue;
+        if ((double)pt.z <= z_th) out_indices.push_back(idx);
+    }
+    return true;
+  }
+
+  bool fit_plane_pca_from_indices(const pcl::PointCloud<pcl::PointXYZ>& cloud, const std::vector<int>& indices, Eigen::Vector3f& n_out, float& d_out){
+    if ((int)indices.size() < 5) return false;
+    Eigen::Vector4f centroid4;
+    
   }
 
   void publish_result(const sensor_msgs::msg::PointCloud2& in_msg, const pcl::PointCloud<pcl::PointXYZ>::Ptr& d_map, const std::map<std::pair<int, int>, Cell>& cells, double bx, double by, double cell_size){
