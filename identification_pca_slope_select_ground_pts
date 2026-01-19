@@ -127,7 +127,7 @@ public:
     this->declare_parameter("check_range", 1);
 
     this->declare_parameter("pca_min_points", 15);
-    this->declare_parameter("planarity_min", 0.4);
+    this->declare_parameter("planarity_min", 0.8);
     this->declare_parameter("scattering_max", 0.20);
 
     this->declare_parameter("z_keep_good", 0.60);
@@ -297,8 +297,8 @@ private:
     const double rough_ground_max = this->get_parameter("rough_ground_max").as_double();
     const double conf_min = this->get_parameter("conf_min").as_double();
     const double step_thr = this->get_parameter("step_thr").as_double();
-    const double theta_max = this->get_parameter("theta_max").as_double();
-    const double slope_margin = this->get_parameter("slope_margin").as_double();
+    //const double theta_max = this->get_parameter("theta_max").as_double();
+    //const double slope_margin = this->get_parameter("slope_margin").as_double();
     const double angle_fla_slo = this->get_parameter("angle_fla_slo").as_double();
     const int check_range = this->get_parameter("check_range").as_int();
 
@@ -349,9 +349,6 @@ private:
       q.pop_front();
       Cell& base_info = cells.find(key)->second;
       double z_up_base = base_info.z_gro_per;
-
-      double base_xc = bx + (double)base_info.ix * cell_size + cell_size / 2.0;
-      double base_yc = by + (double)base_info.iy * cell_size + cell_size / 2.0;
 
       for(int k=0;k<4;k++){
         std::pair<int, int> next_key{key.first + dx[k], key.second + dy[k]};
@@ -560,10 +557,8 @@ private:
 
   bool fit_ground_plane_adaptive(const pcl::PointCloud<pcl::PointXYZ>& cloud, Cell& c, double z_keep_good, double z_keep_bad, double planarity_good, double scattering_good, int plane_fit_min_points)
   {
-    bool good_shape = false;
     double keep_ratio = z_keep_bad;
     if(c.pca_on && std::isfinite(c.planarity) && std::isfinite(c.scattering) && (c.planarity >= planarity_good) && (c.scattering <= scattering_good)){
-      good_shape = true;
       keep_ratio = z_keep_good;
     }
     c.z_keep_ratio = keep_ratio;
@@ -634,10 +629,17 @@ private:
             h_diff = (double)pt.z - z_slo;
           }
           if(h_diff > h_obs){
-            r = 255;
-            g = 0;
-            b = 0;
-            obstacle->points.push_back(pt);
+            if(c.pca_on && (c.planarity >= planarity_min) && (c.scattering <= scattering_max)){
+                r = 255;
+                g = 0;
+                b = 0;
+                obstacle->points.push_back(pt);
+            }
+            else{
+                r = 255;
+                g = 255;
+                b = 0;
+            }
           }
           else if(h_diff > h_undergrowth){
             if(c.pca_on && (c.planarity >= planarity_min) && (c.scattering <= scattering_max)){
