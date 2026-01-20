@@ -36,7 +36,7 @@ struct Cell
     bool obstacle = false;
     bool slope = false;
     bool unknown = false;
-    bool around_unknowm = false;
+    bool around_unknown = false;
 
     double z_gro_per = std::numeric_limits<double>::quiet_NaN();
     double z_rou_per = std::numeric_limits<double>::quiet_NaN();
@@ -44,6 +44,12 @@ struct Cell
     double roughness = std::numeric_limits<double>::quiet_NaN();
     double planarity = std::numeric_limits<double>::quiet_NaN();
     double scattering = std::numeric_limits<double>::quiet_NaN();
+
+    double planarity_obs = std::numeric_limits<double>::quiet_NaN();
+    double scattering_obs = std::numeric_limits<double>::quiet_NaN();
+    Eigen::Vector3f normal_obs = {0.0f, 0.0f, 0.0f};
+    bool pca_obs_on = false;
+
     Eigen::Vector3f normal = {0.0f, 0.0f, 0.0f};
     bool pca_on = false;
 
@@ -88,6 +94,8 @@ public:
     pub_around_unknown = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Identification_around_unknown", 10);
     pub_ground = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Identification_ground", 10);
     pub_undergrowth = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Identification_undergrowth", 10);
+    pub_ground_estimated = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Estimated_ground_points", 10);
+
 
     this->declare_parameter("world_frame", "camera_init");
     this->declare_parameter("base_frame", "body");
@@ -130,6 +138,9 @@ public:
     this->declare_parameter("planarity_min", 0.8);
     this->declare_parameter("scattering_max", 0.20);
 
+    this->declare_parameter("obs_pca_range", 1);
+    this->declare_parameter("ground_plane_range", 1);
+
     this->declare_parameter("z_keep_good", 0.60);
     this->declare_parameter("z_keep_bad", 0.10);
     this->declare_parameter("planarity_good", 0.55);
@@ -137,6 +148,7 @@ public:
     this->declare_parameter("plane_fit_min_points", 12);
     this->declare_parameter("normal_angle_max_deg", 25.0); 
     this->declare_parameter("plane_z_err_max", 0.10); 
+    this->declare_parameter("seed_ground_z_max", 0.20);
   }
 
 private:
@@ -165,6 +177,7 @@ private:
     }
     const double bx = tf_w_b.transform.translation.x;
     const double by = tf_w_b.transform.translation.y;
+    const double bz = tf_w_b.transform.translation.z;
 
     // ボクセルダウンサンプリング
     const double voxel_size = this->get_parameter("voxel_size").as_double();
@@ -190,11 +203,16 @@ private:
     //グリッドを生成し、各グリッドに点の番号を格納
     build_grid(*ds_map, cell_info, bx, by, cell_size);
 
+    const int pca_min_pts = this->get_parameter("pca_min_points").as_int();
     for(auto& kv : cell_info){
       Cell& c = kv.second;
+      if((int)c.pc_indices.size() < pca_min_pts){
+        c.pca_on = false;
+        continue;
+      }
       Eigen::Vector3f n;
       double planarity, scattering;
-      if(cell_pca(*ds_map, c, n, planarity, scattering)){
+      if(pca_from_indices(*ds_map, c.pc_indices, n, planarity, scattering)){
         c.normal = n;
         c.planarity = planarity;
         c.scattering = scattering;
@@ -203,7 +221,31 @@ private:
     }
 
     //周囲のグリッドの情報と比較し、障害物や斜面の識別を行う
-    estimate_ground(*ds_map, cell_info, bx, by, cell_size);
+    estimate_ground(*ds_map, cell_info, bx, by, bz, cell_size);
+
+    double h_min = this->get_parameter("h_undergrowth").as_double();
+    int obs_range = this->get_parameter("obs_pca_range").as_int();
+    int obs_min_pts = this->get_parameter("pca_min_points").as_int();
+
+    for (auto& kv : cell_info){
+      Cell& c = kv.second;
+      std::vector<int> obs_idx;
+      if(!collect_indices_like_obs_with_neighbors(*ds_map, cell_info, c, bx, by, cell_size, obs_range, h_min, obs_min_pts, obs_idx)){
+        c.pca_obs_on = false;
+        continue;
+      }
+      Eigen::Vector3f n_obs;
+      double p_obs, s_obs;
+      if(pca_from_indices(*ds_map, obs_idx, n_obs, p_obs, s_obs)){
+        c.normal_obs = n_obs;
+        c.planarity_obs = p_obs;
+        c.scattering_obs = s_obs;
+        c.pca_obs_on = true;
+      }
+      else{
+        c.pca_obs_on = false;
+      }
+    }
 
     //点群を出力するための関数
     publish_result(*msg, ds_map, cell_info, bx, by, cell_size);
@@ -288,7 +330,7 @@ private:
     return result;
   }
 
-  void estimate_ground(pcl::PointCloud<pcl::PointXYZ>& cloud, std::map<std::pair<int, int>, Cell>& cells, double bx, double by, double cell_size)
+  void estimate_ground(pcl::PointCloud<pcl::PointXYZ>& cloud, std::map<std::pair<int, int>, Cell>& cells, double bx, double by, double bz, double cell_size)
   {
     const int min_pts = this->get_parameter("min_points_per_cell").as_int();
     const int max_pts = this->get_parameter("max_points_per_cell").as_int();
@@ -309,6 +351,8 @@ private:
     const int plane_fit_min_points = this->get_parameter("plane_fit_min_points").as_int();
     const double normal_angle_max_deg = this->get_parameter("normal_angle_max_deg").as_double();
     const double plane_z_err_max = this->get_parameter("plane_z_err_max").as_double();
+    const int ground_plane_range = this->get_parameter("ground_plane_range").as_int();
+    const double seed_ground_z_max = this->get_parameter("seed_ground_z_max").as_double();
 
     double max_ratio = static_cast<double>(max_pts) / static_cast<double>(min_pts); 
     std::deque<std::pair<int,int>> q;
@@ -328,14 +372,15 @@ private:
       }
       c.roughness = c.z_rou_per - c.z_gro_per;
 
-      fit_ground_plane_adaptive(cloud, c, z_keep_good, z_keep_bad, planarity_good, scattering_good, plane_fit_min_points);
+      fit_ground_plane_adaptive_with_neighbors(cloud, cells, c, z_keep_good, z_keep_bad, planarity_good, scattering_good, plane_fit_min_points, ground_plane_range);
       if(c.roughness < rough_ground_max){
         double ratio_pts = static_cast<double>(c.count) / static_cast<double>(min_pts);
         c.ground_candidate = true;
         double pts_score = ratio_pts / max_ratio;
         double rou_score = 1.0 - (c.roughness / rough_ground_max);
         c.ground_confidence = pts_score * rou_score;
-        if(c.ground_confidence >= conf_min){
+        //zが20cm以下の点を対象に地面を決定
+        if((c.ground_confidence >= conf_min) && std::isfinite(c.z_gro_per) && (c.z_gro_per <= bz + seed_ground_z_max)){
           c.detern_ground = true;
           q.push_back(kv.first);
         }
@@ -483,37 +528,6 @@ private:
     }       
   }
 
-  bool cell_pca(const pcl::PointCloud<pcl::PointXYZ>& cloud, const Cell& c, Eigen::Vector3f& cell_normal, double& cell_planarity, double& cell_scattering)
-  {
-    if((int)c.pc_indices.size() < this->get_parameter("pca_min_points").as_int()){
-      return false;
-    }
-    Eigen::Vector4f centroid;
-    pcl::compute3DCentroid(cloud, c.pc_indices, centroid);
-
-    Eigen::Matrix3f covariance_matrix;
-    pcl::computeCovarianceMatrixNormalized(cloud, c.pc_indices, centroid, covariance_matrix);
-    covariance_matrix = 0.5f * (covariance_matrix + covariance_matrix.transpose());
-
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(covariance_matrix);
-    auto eigenvalues = es.eigenvalues();
-    auto eigenvectors = es.eigenvectors();
-
-    double val3 = (double)eigenvalues(0);
-    double val2 = (double)eigenvalues(1);
-    double val1 = (double)eigenvalues(2);
-    cell_normal = eigenvectors.col(0).cast<float>();
-    cell_normal.normalize();
-
-    cell_planarity = (val2 - val3) / val1;
-    cell_scattering = val3 / val1;
-
-    if(std::isfinite(cell_planarity) && std::isfinite(cell_scattering)){
-      return true;
-    }
-    return false;
-  }
-
   bool select_low_z_indices(const pcl::PointCloud<pcl::PointXYZ>& cloud, const Cell& c, double keep_ratio, int min_keep_points, std::vector<int>& out_indices)
   {
     out_indices.clear();
@@ -555,7 +569,7 @@ private:
     return true;
   }
 
-  bool fit_ground_plane_adaptive(const pcl::PointCloud<pcl::PointXYZ>& cloud, Cell& c, double z_keep_good, double z_keep_bad, double planarity_good, double scattering_good, int plane_fit_min_points)
+  bool fit_ground_plane_adaptive_with_neighbors(const pcl::PointCloud<pcl::PointXYZ>& cloud, const std::map<std::pair<int,int>, Cell>& cells, Cell& c, double z_keep_good, double z_keep_bad, double planarity_good, double scattering_good, int plane_fit_min_points, int range)
   {
     double keep_ratio = z_keep_bad;
     if(c.pca_on && std::isfinite(c.planarity) && std::isfinite(c.scattering) && (c.planarity >= planarity_good) && (c.scattering <= scattering_good)){
@@ -563,10 +577,13 @@ private:
     }
     c.z_keep_ratio = keep_ratio;
     std::vector<int> subset;
-    if (!select_low_z_indices(cloud, c,keep_ratio, plane_fit_min_points, subset)) {
+    
+    const int min_keep_points_per_cell = 5;
+    if(!collect_low_z_indices_with_neighbors(cloud, cells, c, range, keep_ratio, min_keep_points_per_cell, plane_fit_min_points, subset)){
       c.ground_plane_on = false;
       return false;
     }
+
     Eigen::Vector3f n;
     float d;
     if (!fit_plane_pca_from_indices(cloud, subset, n, d)) {
@@ -593,7 +610,103 @@ private:
     return std::isfinite(z_out);
   }
 
-  void publish_result(const sensor_msgs::msg::PointCloud2& in_msg, const pcl::PointCloud<pcl::PointXYZ>::Ptr& d_map, const std::map<std::pair<int, int>, Cell>& cells, double bx, double by, double cell_size){
+  bool select_index_like_obs(const pcl::PointCloud<pcl::PointXYZ>& cloud, const Cell& c, double bx, double by, double cell_size, double h_min, std::vector<int>& out_indices)
+  {
+    out_indices.clear();
+    if (!std::isfinite(c.ground_z)) return false;
+    if ((int)c.pc_indices.size() < 5) return false;
+    const double xc = bx + (double)c.ix * cell_size + cell_size / 2.0;
+    const double yc = by + (double)c.iy * cell_size + cell_size / 2.0;
+    for (int idx : c.pc_indices){
+      const auto& pt = cloud.points[idx];
+      if (!std::isfinite(pt.z)) continue;
+      double z_ref = c.ground_z;
+      if (c.slope && c.grad_on){
+        z_ref = c.ground_z + c.dzdx * (pt.x - xc) + c.dzdy * (pt.y - yc);
+      }
+      double h = (double)pt.z - z_ref;
+      if (h > h_min){
+        out_indices.push_back(idx);
+      }
+    }
+    return ((int)out_indices.size() >= 5);
+  }
+
+  bool pca_from_indices(const pcl::PointCloud<pcl::PointXYZ>& cloud, const std::vector<int>& indices, Eigen::Vector3f& n_out, double& planarity_out, double& scattering_out)
+  {
+    if ((int)indices.size() < 5) return false;
+    Eigen::Vector4f centroid;
+    pcl::compute3DCentroid(cloud, indices, centroid);
+    Eigen::Matrix3f cov;
+    pcl::computeCovarianceMatrixNormalized(cloud, indices, centroid, cov);
+    cov = 0.5f * (cov + cov.transpose());
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
+    if (es.info() != Eigen::Success) return false;
+    auto evals = es.eigenvalues();
+    auto evecs = es.eigenvectors();
+    double l3 = (double)evals(0);
+    double l2 = (double)evals(1);
+    double l1 = (double)evals(2);
+    if (!std::isfinite(l1) || l1 <= 1e-12) return false;
+    Eigen::Vector3f n = evecs.col(0).cast<float>();
+    if (!std::isfinite(n.x()) || !std::isfinite(n.y()) || !std::isfinite(n.z())) return false;
+    n.normalize();
+    if (n.z() < 0.0f) n = -n;
+    double plan = (l2 - l3) / l1;
+    double scat = l3 / l1;
+    if (!std::isfinite(plan) || !std::isfinite(scat)) return false;
+    n_out = n;
+    planarity_out = plan;
+    scattering_out = scat;
+    return true;
+  }
+
+  bool collect_indices_like_obs_with_neighbors(const pcl::PointCloud<pcl::PointXYZ>& cloud, const std::map<std::pair<int,int>, Cell>& cells, const Cell& center, double bx, double by, double cell_size, int range, double h_min, int min_total_points, std::vector<int>& out_indices)
+  {
+    out_indices.clear();
+    for(int dy = -range; dy <= range; ++dy){
+      for(int dx = -range; dx <= range; ++dx){
+        std::pair<int,int> key{center.ix + dx, center.iy + dy};
+        auto it = cells.find(key);
+        if(it == cells.end()) continue;
+        const Cell& nb = it->second;
+        std::vector<int> tmp;
+        if(select_index_like_obs(cloud, nb, bx, by, cell_size, h_min, tmp)){
+          //障害物と検出された点をout_indicesにまとめて追加
+          out_indices.insert(out_indices.end(), tmp.begin(), tmp.end());
+        }
+      }
+    }
+    if((int)out_indices.size() < min_total_points) return false;
+    std::sort(out_indices.begin(), out_indices.end());
+    //重複している点を削除
+    out_indices.erase(std::unique(out_indices.begin(), out_indices.end()), out_indices.end());
+    return ((int)out_indices.size() >= min_total_points);
+  }
+
+  bool collect_low_z_indices_with_neighbors(const pcl::PointCloud<pcl::PointXYZ>& cloud, const std::map<std::pair<int,int>, Cell>& cells, const Cell& center, int range, double keep_ratio, int min_keep_points_per_cell, int min_total_points, std::vector<int>& out_indices)
+  {
+    out_indices.clear();
+    for(int dy = -range; dy <= range; ++dy){
+      for(int dx = -range; dx <= range; ++dx){
+        std::pair<int,int> key{center.ix + dx, center.iy + dy};
+        auto it = cells.find(key);
+        if(it == cells.end()) continue;
+        const Cell& nb = it->second;
+        std::vector<int> tmp;
+        if(select_low_z_indices(cloud, nb, keep_ratio, min_keep_points_per_cell, tmp)){
+          out_indices.insert(out_indices.end(), tmp.begin(), tmp.end());
+        }
+      }
+    }
+    if((int)out_indices.size() < min_total_points) return false;
+    std::sort(out_indices.begin(), out_indices.end());
+    out_indices.erase(std::unique(out_indices.begin(), out_indices.end()), out_indices.end());
+    return ((int)out_indices.size() >= min_total_points);
+  }
+
+  void publish_result(const sensor_msgs::msg::PointCloud2& in_msg, const pcl::PointCloud<pcl::PointXYZ>::Ptr& d_map, const std::map<std::pair<int, int>, Cell>& cells, double bx, double by, double cell_size)
+  {
     const double h_undergrowth = this->get_parameter("h_undergrowth").as_double();
     const double h_obs = this->get_parameter("h_obs").as_double();
     const double planarity_min = this->get_parameter("planarity_min").as_double();
@@ -604,13 +717,18 @@ private:
     pcl::PointCloud<pcl::PointXYZ>::Ptr around_unknown(new pcl::PointCloud<pcl::PointXYZ>);
     pcl::PointCloud<pcl::PointXYZ>::Ptr ground(new pcl::PointCloud<pcl::PointXYZ>);
     pcl::PointCloud<pcl::PointXYZ>::Ptr undergrowth(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr estimated_ground(new pcl::PointCloud<pcl::PointXYZ>);
     colored_pc->points.reserve(d_map->points.size());
     obstacle->points.reserve(d_map->points.size() / 2);
     slope->points.reserve(d_map->points.size() / 2);
+    estimated_ground->points.reserve(d_map->points.size() / 2);
     for(auto& kv : cells){
       auto& c = kv.second;
       for(auto& indx : c.pc_indices){
         auto& pt = d_map->points[indx];
+        if(c.detern_ground && std::isfinite(c.ground_z) && (pt.z <= c.z_gro_per)){
+          estimated_ground->points.push_back(pt);
+        }
         uint8_t r = 0;
         uint8_t g = 255;
         uint8_t b = 0;
@@ -629,7 +747,7 @@ private:
             h_diff = (double)pt.z - z_slo;
           }
           if(h_diff > h_obs){
-            if(c.pca_on && (c.planarity >= planarity_min) && (c.scattering <= scattering_max)){
+            if(c.pca_obs_on && (c.planarity_obs >= planarity_min) && (c.scattering_obs <= scattering_max)){
                 r = 255;
                 g = 0;
                 b = 0;
@@ -642,7 +760,7 @@ private:
             }
           }
           else if(h_diff > h_undergrowth){
-            if(c.pca_on && (c.planarity >= planarity_min) && (c.scattering <= scattering_max)){
+            if(c.pca_obs_on && (c.planarity_obs >= planarity_min) && (c.scattering_obs <= scattering_max)){
               //乗り越え可能な障害物
               //紫色
               r = 255;
@@ -689,26 +807,31 @@ private:
     undergrowth -> height = 1;
     ground -> width = ground -> points.size();
     ground -> height = 1;
+    estimated_ground -> width = estimated_ground -> points.size();
+    estimated_ground -> height = 1;
     
-    sensor_msgs::msg::PointCloud2 col_msg, obs_msg, slo_msg, around_unknown_msg, ground_msg, undergrowth_msg;
+    sensor_msgs::msg::PointCloud2 col_msg, obs_msg, slo_msg, around_unknown_msg, ground_msg, undergrowth_msg, estimated_ground_msg;
     pcl::toROSMsg(*colored_pc, col_msg);
     pcl::toROSMsg(*obstacle, obs_msg);
     pcl::toROSMsg(*slope, slo_msg);
     pcl::toROSMsg(*around_unknown, around_unknown_msg);
     pcl::toROSMsg(*ground, ground_msg);
     pcl::toROSMsg(*undergrowth, undergrowth_msg);
+    pcl::toROSMsg(*estimated_ground, estimated_ground_msg);
     col_msg.header = in_msg.header;  
     obs_msg.header = in_msg.header;
     slo_msg.header = in_msg.header; 
     around_unknown_msg.header = in_msg.header; 
     ground_msg.header = in_msg.header;
     undergrowth_msg.header = in_msg.header;
+    estimated_ground_msg.header = in_msg.header;
     pub_colored -> publish(col_msg);
     pub_obstacle -> publish(obs_msg);
     pub_slope -> publish(slo_msg);
     pub_around_unknown -> publish(around_unknown_msg);
     pub_ground->publish(ground_msg);
     pub_undergrowth->publish(undergrowth_msg);
+    pub_ground_estimated -> publish(estimated_ground_msg);
   }
 
 private:
@@ -719,6 +842,8 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_around_unknown;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_ground;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_undergrowth;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_ground_estimated;
+
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
