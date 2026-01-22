@@ -8,13 +8,12 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/filter.h>
 
-#include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/kdtree/kdtree.h>
+#include <pcl/segmentation/extract_clusters.h>
 
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
-
-#include <Eigen/Dense>
 
 #include <deque>
 #include <map>
@@ -22,19 +21,36 @@
 #include <limits>
 #include <algorithm>
 #include <cmath>
+#include <unordered_set>
+
+#include <Eigen/Dense>
 
 struct Cell
 {
-    int ix = 0;
-    int iy = 0;
-    std::vector<int> indices;
-    std::vector<float> zs;
-    
-    double z_seed = std::numeric_limits<double>::quiet_NaN();
-    Eigen::Vector3f n = Eigen::Vector3f(0.0f, 0.0f, 1.0f);
-    float d = 0.0f;
-    bool plane_on = false;
-    double tilt_deg = std::numeric_limits<double>::quiet_NaN();
+  int ix = 0;
+  int iy = 0;
+
+  std::vector<int> indices;  // cloud_map 内の点 index
+  double min_z = std::numeric_limits<double>::infinity();
+  double z_max = -std::numeric_limits<double>::infinity();
+
+  // --- ground plane (地面点のみ) ---
+  std::vector<int> ground_indices;
+  Eigen::Vector3f n_ground = Eigen::Vector3f(0,0,1);
+  float d_ground = 0.0f;
+  bool has_ground_plane = false;
+
+  // --- non-ground plane (非地面点のみ) ---
+  std::vector<int> nonground_indices;
+  Eigen::Vector3f n_ng = Eigen::Vector3f(0,0,1);
+  float d_ng = 0.0f;
+  bool has_ng_plane = false;
+
+  // --- cell classification flags ---
+  bool is_ground = false; // 平地（緑）
+  bool is_slope  = false; // 斜面（シアン）
+  bool is_trav   = false; // 乗り越え可（黄）
+  bool is_block  = false; // 乗り越え不可（赤）
 };
 
 struct TimeCloud
@@ -43,111 +59,139 @@ struct TimeCloud
   pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_world;
 };
 
-double deg2rad(double deg)
+// -------------------- math helpers --------------------
+static inline double rad2deg(double rad)
 {
-    return deg * 3.14159265358979323846 / 180.0;
+  return rad * 180.0 / 3.14159265358979323846;
 }
 
-double rad2deg(double rad)
+static inline double angle_deg(const Eigen::Vector3f& a, const Eigen::Vector3f& b)
 {
-    return rad * 180.0 / 3.14159265358979323846;
+  double c = (double)a.dot(b);
+  c = std::max(-1.0, std::min(1.0, c));
+  return rad2deg(std::acos(c));
 }
 
-double percentile_simple(std::vector<float> v, double per)
+// 平面 n.x*x + n.y*y + n.z*z + d = 0 から z を求める
+static inline bool plane_z_at_xy(const Eigen::Vector3f& n, float d, float x, float y, float& z_out)
 {
-    if(v.empty()) return std::numeric_limits<double>::quiet_NaN();
-
-    std::sort(v.begin(), v.end());
-    int n = (int)v.size();
-    int k = (int)std::floor(per * (double)(n - 1));
-    return (double)v[k];
+  if(std::abs(n.z()) < 1e-6f) return false;
+  z_out = -(n.x()*x + n.y()*y + d) / n.z();
+  return std::isfinite(z_out);
 }
 
-bool plane_z_at_xy_simple(const Eigen::Vector3f& n, float d, double x, double y, double& z_out)
+// PCAで平面を当てて法線を求める
+static inline bool fit_plane_pca(
+  const pcl::PointCloud<pcl::PointXYZ>& cloud,
+  const std::vector<int>& indices,
+  Eigen::Vector3f& n_out,
+  float& d_out)
 {
-    double nx = (double)n.x();
-    double ny = (double)n.y();
-    double nz = (double)n.z();
+  if ((int)indices.size() < 10) return false;
 
-    if(!std::isfinite(nx) || !std::isfinite(ny) || !std::isfinite(nz)) return false;
-    if(std::fabs(nz) < 1e-6) return false;
+  Eigen::Vector3f mean(0,0,0);
+  int cnt = 0;
+  for(int idx : indices){
+    const auto& p = cloud.points[idx];
+    if(!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+    mean += Eigen::Vector3f(p.x, p.y, p.z);
+    cnt++;
+  }
+  if(cnt < 10) return false;
+  mean /= (float)cnt;
 
-    z_out = (-(nx * x + ny * y + (double)d) / nz);
-    return std::isfinite(z_out);
+  Eigen::Matrix3f cov = Eigen::Matrix3f::Zero();
+  for(int idx : indices){
+    const auto& p = cloud.points[idx];
+    if(!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+    Eigen::Vector3f q(p.x, p.y, p.z);
+    Eigen::Vector3f d = q - mean;
+    cov += d * d.transpose();
+  }
+  cov /= (float)cnt;
+
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
+  if(es.info() != Eigen::Success) return false;
+
+  // 最小固有値の固有ベクトルが法線
+  Eigen::Vector3f n = es.eigenvectors().col(0);
+  n.normalize();
+
+  // 上向きに揃える
+  if(n.z() < 0) n = -n;
+
+  n_out = n;
+  d_out = -n.dot(mean);
+  return true;
 }
 
-double plane_tilt_deg_from_normal_simple(Eigen::Vector3f n)
-{
-    if(n.norm() < 1e-6f) return std::numeric_limits<double>::quiet_NaN();
-    n.normalize();
-
-    double nz = (double)n.z();
-    return rad2deg(std::acos(nz));
-}
-
+// -------------------- Node --------------------
 class IdentificationNode : public rclcpp::Node
 {
 public:
   IdentificationNode()
-  : Node("Identification_node"),tf_buffer_(this->get_clock()),tf_listener_(tf_buffer_)
+  : Node("Identification_node"), tf_buffer_(this->get_clock()), tf_listener_(tf_buffer_)
   {
     sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       "/cloud_registered", rclcpp::SensorDataQoS(),
       std::bind(&IdentificationNode::cloud_callback, this, std::placeholders::_1));
-    
-    pub_colored_  = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Identification", 10);
-    pub_ground_   = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Identification_ground", 10);
-    pub_slope_    = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Identification_slope", 10);
-    pub_step_     = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Identification_step", 10);
-    pub_obstacle_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Identification_obstacle", 10);
-    pub_unknown_  = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Identification_unknown", 10);
 
+    pub_colored_   = this->create_publisher<sensor_msgs::msg::PointCloud2>("/ground_cluster/colored", 10);
+    pub_ground_    = this->create_publisher<sensor_msgs::msg::PointCloud2>("/ground_cluster/ground", 10);
+    pub_nonground_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/ground_cluster/nonground", 10);
+
+    // frames
     this->declare_parameter("world_frame", "camera_init");
-    this->declare_parameter("base_frame", "body");
+    this->declare_parameter("base_frame",  "body");
 
+    // map build
     this->declare_parameter("voxel_size", 0.05);
-    this->declare_parameter("time_window", 5.0);
+    this->declare_parameter("time_window", 10.0);
 
+    // grid
     this->declare_parameter("cell_size", 0.20);
     this->declare_parameter("min_points_per_cell", 10);
 
-    this->declare_parameter("patch_range", 1);
-    this->declare_parameter("ground_percentile", 0.20);
-    this->declare_parameter("seed_margin", 0.05);
+    // Step1: “最下点 + 帯域”
+    this->declare_parameter("ground_band", 0.10);
 
-    this->declare_parameter("ransac_dist_thr", 0.05);
-    this->declare_parameter("ransac_max_iter", 200);
-    this->declare_parameter("ground_plane_max_deg", 40.0);
+    // Step2: clustering parameters
+    this->declare_parameter("cluster_tolerance", 0.20);
+    this->declare_parameter("min_cluster_size", 200);
+    this->declare_parameter("max_cluster_size", 200000);
 
-    this->declare_parameter("angle_fla_slo", 10.0);
-    this->declare_parameter("slope_max_deg", 30.0);
+    this->declare_parameter("extra_ground_z_margin", 0.05);
+    this->declare_parameter("extra_ground_size_ratio", 0.10);
 
-    this->declare_parameter("step_thr", 0.05);
-    this->declare_parameter("h_obs", 0.15);
+    // ---- 追加：識別条件 ----
+    this->declare_parameter("flat_deg_max", 5.0);        // 平地とみなす最大角度
+    this->declare_parameter("slope_deg_max", 30.0);      // 斜面とみなす最大角度
+    this->declare_parameter("step_h_max", 0.15);         // 15cm
+    this->declare_parameter("ref_search_radius", 1.0);   // [m] 近傍地面探索半径（ルール1用）
+    this->declare_parameter("flat_ref_deg_max", 10.0);   // 近傍基準地面として使える傾き（<=10deg）
 
-    this->declare_parameter("ground_h_thr", 0.05);
-
-    RCLCPP_INFO(this->get_logger(), "Readable patch-ground segmentation node initialized.");
-
+    RCLCPP_INFO(this->get_logger(), "IdentificationNode initialized (min-z per cell + largest cluster + cell bool classification).");
   }
 
 private:
+  // ---- callback ----
   void cloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
   {
     const std::string world_frame = this->get_parameter("world_frame").as_string();
     const std::string base_frame  = this->get_parameter("base_frame").as_string();
 
-    // 座標情報を持った点群データをinputに格納
+    // msg -> pcl
     pcl::PointCloud<pcl::PointXYZ>::Ptr input(new pcl::PointCloud<pcl::PointXYZ>);
     pcl::fromROSMsg(*msg, *input);
 
-    // 外れ点除去
+    // remove NaN
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_filtered(new pcl::PointCloud<pcl::PointXYZ>);
     std::vector<int> nan_indices;
     pcl::removeNaNFromPointCloud(*input, *cloud_filtered, nan_indices);
 
-    // tfでbaseframeをworldframeで取得
     const rclcpp::Time stamp(msg->header.stamp);
+
+    // TF lookup (world <- base)
     geometry_msgs::msg::TransformStamped tf_w_b;
     try{
       tf_w_b = tf_buffer_.lookupTransform(world_frame, base_frame, stamp);
@@ -159,102 +203,376 @@ private:
     const double bx = tf_w_b.transform.translation.x;
     const double by = tf_w_b.transform.translation.y;
 
-    // ボクセルダウンサンプリング
+    // downsample current frame
     const double voxel_size = this->get_parameter("voxel_size").as_double();
     pcl::PointCloud<pcl::PointXYZ>::Ptr down = voxel_downsample(cloud_filtered, voxel_size);
 
-    //過去に取得した点群に新しい点群を積み上げる
+    // push to buffer
     TimeCloud tc;
     tc.stamp = stamp;
     tc.cloud_world = down;
     cloud_buffer_.push_back(tc);
 
-    //time_window秒以上前の点群は捨てる
+    // pop old
     const double time_window = this->get_parameter("time_window").as_double();
     pop_old_clouds(stamp, time_window);
 
-    //積み上げた点群を更にダウンサンプリング
+    // build merged map and downsample again
     pcl::PointCloud<pcl::PointXYZ>::Ptr merged = build_map();
-    pcl::PointCloud<pcl::PointXYZ>::Ptr ds_map = voxel_downsample(merged, voxel_size);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_map = voxel_downsample(merged, voxel_size);
 
+    // Step1: build grid and min_z per cell
     const double cell_size = this->get_parameter("cell_size").as_double();
     const int min_pts_cell = this->get_parameter("min_points_per_cell").as_int();
 
-    //グリッドを生成し、各グリッドに点の番号を格納
     std::map<std::pair<int,int>, Cell> cells;
-    build_grid(*ds_map, cells, bx, by, cell_size);
+    build_grid_and_minz(*cloud_map, cells, bx, by, cell_size);
 
-    // --- seed height per cell ---
-    const double seed_per = this->get_parameter("ground_percentile").as_double();
-    for(auto& kv : cells){
-      Cell& c = kv.second;
-      if((int)c.indices.size() < min_pts_cell){
-        c.plane_on = false;
-        continue;
+    // collect ground-candidate indices (min_z + band)
+    const double ground_band = this->get_parameter("ground_band").as_double();
+    std::vector<int> candidate_indices;
+    candidate_indices.reserve(cloud_map->points.size() / 4);
+
+    for(const auto& kv : cells){
+      const Cell& c = kv.second;
+      if((int)c.indices.size() < min_pts_cell) continue;
+      if(!std::isfinite(c.min_z)) continue;
+
+      const double z_thr = c.min_z + ground_band;
+
+      for(int idx : c.indices){
+        const auto& pt = cloud_map->points[idx];
+        if(!std::isfinite(pt.z)) continue;
+        if((double)pt.z <= z_thr){
+          candidate_indices.push_back(idx);
+        }
       }
-      c.z_seed = percentile_simple(c.zs, seed_per);
     }
 
-    // --- plane per cell ---
-    const int patch_range = this->get_parameter("patch_range").as_int();
-    const double seed_margin = this->get_parameter("seed_margin").as_double();
-    const double ransac_dist_thr = this->get_parameter("ransac_dist_thr").as_double();
-    const int ransac_max_iter = this->get_parameter("ransac_max_iter").as_int();
-    const double ground_plane_max_deg = this->get_parameter("ground_plane_max_deg").as_double();
+    if(candidate_indices.size() < 100){
+      publish_all_nonground(*msg, cloud_map);
+      return;
+    }
 
+    // unique
+    std::sort(candidate_indices.begin(), candidate_indices.end());
+    candidate_indices.erase(std::unique(candidate_indices.begin(), candidate_indices.end()), candidate_indices.end());
+
+    // build candidate cloud
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cand_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    cand_cloud->points.reserve(candidate_indices.size());
+
+    // map: cand_cloud index -> original index
+    std::vector<int> cand_to_orig;
+    cand_to_orig.reserve(candidate_indices.size());
+
+    for(int orig_idx : candidate_indices){
+      cand_cloud->points.push_back(cloud_map->points[orig_idx]);
+      cand_to_orig.push_back(orig_idx);
+    }
+    cand_cloud->width = (uint32_t)cand_cloud->points.size();
+    cand_cloud->height = 1;
+
+    // Step2: Euclidean clustering on candidate points
+    std::vector<pcl::PointIndices> cluster_indices;
+    euclidean_cluster(cand_cloud, cluster_indices);
+
+    if(cluster_indices.empty()){
+      publish_all_nonground(*msg, cloud_map);
+      return;
+    }
+
+    // pick largest cluster
+    int best_k = -1;
+    size_t best_size = 0;
+    for(int k = 0; k < (int)cluster_indices.size(); ++k){
+      size_t sz = cluster_indices[k].indices.size();
+      if(sz > best_size){
+        best_size = sz;
+        best_k = k;
+      }
+    }
+
+    if(best_k < 0 || best_size < 50){
+      publish_all_nonground(*msg, cloud_map);
+      return;
+    }
+
+    const double z_margin  = this->get_parameter("extra_ground_z_margin").as_double();
+    const double ratio_min = this->get_parameter("extra_ground_size_ratio").as_double();
+
+    double best_min_z = cluster_min_z(cand_cloud, cluster_indices, best_k);
+    if(!std::isfinite(best_min_z)){
+      publish_all_nonground(*msg, cloud_map);
+      return;
+    }
+
+    std::vector<int> ground_cluster_ids;
+    ground_cluster_ids.push_back(best_k);
+    const size_t best_sz = cluster_indices[best_k].indices.size();
+
+    for(int k = 0; k < (int)cluster_indices.size(); ++k){
+      if(k == best_k) continue;
+      const size_t sz = cluster_indices[k].indices.size();
+      if(sz < (size_t)std::ceil((double)best_sz * ratio_min)) continue;
+      double mz = cluster_min_z(cand_cloud, cluster_indices, k);
+      if(!std::isfinite(mz)) continue;
+      if(mz <= best_min_z + z_margin){
+        ground_cluster_ids.push_back(k);
+      }
+    }
+
+    // build ground mask (original indices)
+    std::unordered_set<int> ground_set;
+    ground_set.reserve(best_size * 2);
+    for(int cid : ground_cluster_ids){
+      for(int cand_idx : cluster_indices[cid].indices){
+        int orig_idx = cand_to_orig[cand_idx];
+        ground_set.insert(orig_idx);
+      }
+    }
+
+    // 1) 各セルに ground_indices / nonground_indices を入れて平面推定
     for(auto& kv : cells){
       Cell& c = kv.second;
 
-      if(!std::isfinite(c.z_seed)){
-        c.plane_on = false;
-        continue;
+      c.ground_indices.clear();
+      c.nonground_indices.clear();
+      c.has_ground_plane = false;
+      c.has_ng_plane = false;
+
+      c.is_ground = false;
+      c.is_slope  = false;
+      c.is_trav   = false;
+      c.is_block  = false;
+
+      for(int idx : c.indices){
+        if(ground_set.find(idx) != ground_set.end()){
+          c.ground_indices.push_back(idx);
+        }else{
+          c.nonground_indices.push_back(idx);
+        }
       }
 
-      std::vector<int> cand;
-      collect_patch_candidates(*ds_map, cells, c, patch_range, seed_margin, cand);
-
-      if((int)cand.size() < 30){
-        c.plane_on = false;
-        continue;
+      // 地面平面（地面クラスタ由来）
+      if((int)c.ground_indices.size() >= min_pts_cell){
+        Eigen::Vector3f n;
+        float d;
+        if(fit_plane_pca(*cloud_map, c.ground_indices, n, d)){
+          c.n_ground = n;
+          c.d_ground = d;
+          c.has_ground_plane = true;
+        }
       }
 
-      Eigen::Vector3f n;
-      float d;
-      int inliers_n = 0;
-
-      if(!fit_plane_ransac_indices_easy(*ds_map, cand, ransac_dist_thr, ransac_max_iter, n, d, inliers_n)){
-        c.plane_on = false;
-        continue;
+      // 非地面平面
+      if((int)c.nonground_indices.size() >= min_pts_cell){
+        Eigen::Vector3f n;
+        float d;
+        if(fit_plane_pca(*cloud_map, c.nonground_indices, n, d)){
+          c.n_ng = n;
+          c.d_ng = d;
+          c.has_ng_plane = true;
+        }
       }
-
-      // normalize and nz>=0
-      if(n.norm() < 1e-6f){
-        c.plane_on = false;
-        continue;
-      }
-      n.normalize();
-      if(n.z() < 0.0f){
-        n = -n;
-        d = -d;
-      }
-
-      double tilt = plane_tilt_deg_from_normal_simple(n);
-      if(!std::isfinite(tilt) || tilt > ground_plane_max_deg){
-        c.plane_on = false;
-        continue;
-      }
-
-      c.n = n;
-      c.d = d;
-      c.plane_on = true;
-      c.tilt_deg = tilt;
     }
 
-    publish_result(*msg, ds_map, cells, bx, by, cell_size);
+    // ---- cell classification params ----
+    const double flat_deg_max     = this->get_parameter("flat_deg_max").as_double();       // 緑
+    const double slope_deg_max    = this->get_parameter("slope_deg_max").as_double();      // シアン
+    const double step_h_max       = this->get_parameter("step_h_max").as_double();         // 黄/赤
+    const double ref_R            = this->get_parameter("ref_search_radius").as_double();
+    const double flat_ref_deg_max = this->get_parameter("flat_ref_deg_max").as_double();   // 参照地面の傾き
+
+    const int ref_range = std::max(1, (int)std::ceil(ref_R / cell_size));
+    Eigen::Vector3f z_axis(0,0,1);
+
+    // 2) 近傍地面に対して角度差・高さ差で分類
+    for(auto& kv : cells){
+      Cell& c = kv.second;
+
+      c.is_ground = false;
+      c.is_slope  = false;
+      c.is_trav   = false;
+      c.is_block  = false;
+
+      // --- セル表面平面（ここが "地面クラスタ内の斜面" に効く） ---
+      bool has_plane = false;
+      Eigen::Vector3f n_cell = z_axis;
+
+      // ng_plane があるならそれを優先（地面クラスタ内でも傾きを拾える）
+      if(c.has_ng_plane){
+        n_cell = c.n_ng;
+        has_plane = true;
+      }else if(c.has_ground_plane){
+        n_cell = c.n_ground;
+        has_plane = true;
+      }
+
+      if(!has_plane){
+        c.is_block = true;
+        continue;
+      }
+
+      const double z_range = c.z_max - c.min_z;
+      const bool tall_object_like = std::isfinite(z_range) && (z_range > step_h_max * 1.2);
+      const double tilt = angle_deg(n_cell, z_axis);
+      if(!tall_object_like){
+        if(tilt <= flat_deg_max){
+          c.is_ground = true;
+          continue;
+        }
+        if(tilt <= slope_deg_max){
+          c.is_slope = true;
+          continue;
+        }
+      }
+
+      // --- 近傍の基準地面平面を探す ---
+      bool found_ref = false;
+      Eigen::Vector3f n_ref = z_axis;
+      float d_ref = 0.0f;
+      float best_dist = std::numeric_limits<float>::infinity();
+
+      // セル中心座標（world）
+      float xc = (float)(bx + (c.ix + 0.5) * cell_size);
+      float yc = (float)(by + (c.iy + 0.5) * cell_size);
+
+      for(int dy=-ref_range; dy<=ref_range; ++dy){
+        for(int dx=-ref_range; dx<=ref_range; ++dx){
+          auto it = cells.find({c.ix + dx, c.iy + dy});
+          if(it == cells.end()) continue;
+
+          const Cell& nb = it->second;
+          if(!nb.has_ground_plane) continue;
+
+          double dist = std::sqrt((double)(dx*dx + dy*dy)) * cell_size;
+          if(dist > ref_R) continue;
+
+          // “水平に近い ground_plane のみ”基準として採用
+          double tilt = angle_deg(nb.n_ground, z_axis);
+          if(tilt > flat_ref_deg_max) continue;
+
+          if((float)dist < best_dist){
+            best_dist = (float)dist;
+            n_ref = nb.n_ground;
+            d_ref = nb.d_ground;
+            found_ref = true;
+          }
+        }
+      }
+
+      // 見つからなければ鉛直基準（角度差中心で分類）
+      if(!found_ref){
+        n_ref = z_axis;
+        d_ref = 0.0f;
+      }
+
+      float z_ref = 0.f;
+      bool ok_ref = plane_z_at_xy(n_ref, d_ref, xc, yc, z_ref);
+
+      double dz = 999.0;
+      if(ok_ref){
+        if(std::isfinite(c.z_max)){
+          dz = std::abs((double)c.z_max - (double)z_ref);
+        }else if(std::isfinite(c.min_z)){
+          dz = std::abs((double)c.min_z - (double)z_ref);
+        }
+      }
+      if(dz <= step_h_max){
+        c.is_trav = true;
+      }else{
+        c.is_block = true;
+      }
+    }
+
+    // -------- publish clouds --------
+    pcl::PointCloud<pcl::PointXYZ>::Ptr ground(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr nonground(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored(new pcl::PointCloud<pcl::PointXYZRGB>);
+
+    ground->points.reserve(cloud_map->points.size());
+    nonground->points.reserve(cloud_map->points.size());
+    colored->points.reserve(cloud_map->points.size());
+
+    auto cell_key_of_point = [&](const pcl::PointXYZ& pt)->std::pair<int,int>{
+      double xl = (double)pt.x - bx;
+      double yl = (double)pt.y - by;
+      int ix = (int)std::floor(xl / cell_size);
+      int iy = (int)std::floor(yl / cell_size);
+      return {ix, iy};
+    };
+
+    for(int i = 0; i < (int)cloud_map->points.size(); ++i){
+      const auto& pt = cloud_map->points[i];
+
+      pcl::PointXYZRGB prgb;
+      prgb.x = pt.x; prgb.y = pt.y; prgb.z = pt.z;
+
+      auto key = cell_key_of_point(pt);
+      auto it  = cells.find(key);
+
+      bool g=false, s=false, t=false, b=true;
+
+      if(it != cells.end()){
+        const Cell& c = it->second;
+        g = c.is_ground;
+        s = c.is_slope;
+        t = c.is_trav;
+        b = c.is_block;
+      }
+
+      if(g){
+        // ground = green
+        prgb.r = 0; prgb.g = 255; prgb.b = 0;
+        ground->points.push_back(pt);
+      }else{
+        if(s){
+          // slope = cyan
+          prgb.r = 0; prgb.g = 255; prgb.b = 255;
+        }else if(t){
+          // traversable obstacle = yellow
+          prgb.r = 255; prgb.g = 255; prgb.b = 0;
+        }else if(b){
+          // blocked obstacle = red
+          prgb.r = 255; prgb.g = 0; prgb.b = 0;
+        }else{
+          prgb.r = 255; prgb.g = 0; prgb.b = 255;
+        }
+        nonground->points.push_back(pt);
+      }
+
+      colored->points.push_back(prgb);
+    }
+
+    finalize_cloud(ground);
+    finalize_cloud(nonground);
+    finalize_cloud(colored);
+
+    sensor_msgs::msg::PointCloud2 msg_col, msg_g, msg_ng;
+    pcl::toROSMsg(*colored, msg_col);
+    pcl::toROSMsg(*ground, msg_g);
+    pcl::toROSMsg(*nonground, msg_ng);
+
+    msg_col.header = msg->header;
+    msg_g.header   = msg->header;
+    msg_ng.header  = msg->header;
+
+    pub_colored_->publish(msg_col);
+    pub_ground_->publish(msg_g);
+    pub_nonground_->publish(msg_ng);
+
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+      "map=%zu cand=%zu clusters=%zu ground_set=%zu out_ground=%zu",
+      cloud_map->points.size(),
+      cand_cloud->points.size(),
+      cluster_indices.size(),
+      ground_set.size(),
+      ground->points.size());
   }
 
-  pcl::PointCloud<pcl::PointXYZ>::Ptr voxel_downsample(
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr& input, double vx)
+  // ---- helpers ----
+  pcl::PointCloud<pcl::PointXYZ>::Ptr voxel_downsample(const pcl::PointCloud<pcl::PointXYZ>::Ptr& input, double vx)
   {
     pcl::VoxelGrid<pcl::PointXYZ> voxel;
     voxel.setInputCloud(input);
@@ -283,7 +601,9 @@ private:
     return merged;
   }
 
-  void build_grid(const pcl::PointCloud<pcl::PointXYZ>& cloud, std::map<std::pair<int,int>, Cell>& cells, double bx, double by, double cell_size)
+  void build_grid_and_minz(const pcl::PointCloud<pcl::PointXYZ>& cloud,
+                           std::map<std::pair<int,int>, Cell>& cells,
+                           double bx, double by, double cell_size)
   {
     cells.clear();
 
@@ -301,197 +621,80 @@ private:
       c.ix = ix;
       c.iy = iy;
       c.indices.push_back(i);
-      c.zs.push_back((float)pt.z);
+
+      if((double)pt.z < c.min_z) c.min_z = (double)pt.z;
+      if((double)pt.z > c.z_max) c.z_max = (double)pt.z;
     }
   }
 
-  void collect_patch_candidates(const pcl::PointCloud<pcl::PointXYZ>& cloud, const std::map<std::pair<int,int>, Cell>& cells, const Cell& center, int range, double seed_margin, std::vector<int>& out_indices)
+  void euclidean_cluster(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+                         std::vector<pcl::PointIndices>& cluster_indices)
   {
-    out_indices.clear();
+    cluster_indices.clear();
 
-    for(int dy = -range; dy <= range; ++dy){
-      for(int dx = -range; dx <= range; ++dx){
-        auto it = cells.find({center.ix + dx, center.iy + dy});
-        if(it == cells.end()) continue;
+    const double tol = this->get_parameter("cluster_tolerance").as_double();
+    const int min_sz = this->get_parameter("min_cluster_size").as_int();
+    const int max_sz = this->get_parameter("max_cluster_size").as_int();
 
-        const Cell& nb = it->second;
-        if(!std::isfinite(nb.z_seed)) continue;
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    tree->setInputCloud(cloud);
 
-        double z_ref = nb.z_seed;
-
-        for(int idx : nb.indices){
-          const auto& pt = cloud.points[idx];
-          if(!std::isfinite(pt.z)) continue;
-
-          if((double)pt.z <= z_ref + seed_margin){
-            out_indices.push_back(idx);
-          }
-        }
-      }
-    }
-
-    std::sort(out_indices.begin(), out_indices.end());
-    out_indices.erase(std::unique(out_indices.begin(), out_indices.end()), out_indices.end());
+    pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+    ec.setClusterTolerance(tol);
+    ec.setMinClusterSize(min_sz);
+    ec.setMaxClusterSize(max_sz);
+    ec.setSearchMethod(tree);
+    ec.setInputCloud(cloud);
+    ec.extract(cluster_indices);
   }
 
-  bool fit_plane_ransac_indices(const pcl::PointCloud<pcl::PointXYZ>& cloud, const std::vector<int>& indices, double dist_thr, int max_iter, Eigen::Vector3f& n_out, float& d_out, int& inliers_n_out)
+  template<typename CloudPtrT>
+  void finalize_cloud(CloudPtrT& cloud)
   {
-    inliers_n_out = 0;
-    if((int)indices.size() < 30) return false;
-
-    pcl::SACSegmentation<pcl::PointXYZ> seg;
-    seg.setOptimizeCoefficients(true);
-    seg.setModelType(pcl::SACMODEL_PLANE);
-    seg.setMethodType(pcl::SAC_RANSAC);
-    seg.setDistanceThreshold(dist_thr);
-    seg.setMaxIterations(max_iter);
-
-    pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
-    pcl::ModelCoefficients::Ptr coeff(new pcl::ModelCoefficients);
-
-    pcl::IndicesPtr idx_ptr(new std::vector<int>(indices));
-    seg.setInputCloud(cloud.makeShared());
-    seg.setIndices(idx_ptr);
-
-    seg.segment(*inliers, *coeff);
-    if(inliers->indices.empty()) return false;
-    if(coeff->values.size() < 4) return false;
-
-    // 平面の式: ax + by + cz + d = 0
-    float a = coeff->values[0];
-    float b = coeff->values[1];
-    float c = coeff->values[2];
-    float d = coeff->values[3];
-
-    Eigen::Vector3f n(a,b,c);
-    if(n.norm() < 1e-6f) return false;
-
-    n_out = n;
-    d_out = d;
-    inliers_n_out = (int)inliers->indices.size();
-    return true;
+    cloud->width = (uint32_t)cloud->points.size();
+    cloud->height = 1;
+    cloud->is_dense = true;
   }
 
-  void publish_result(const sensor_msgs::msg::PointCloud2& in_msg, const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud, const std::map<std::pair<int,int>, Cell>& cells)
+  void publish_all_nonground(const sensor_msgs::msg::PointCloud2& in_msg,
+                            const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud)
   {
-
-    const double flat_max_deg  = this->get_parameter("angle_fla_slo").as_double();
-    const double slope_max_deg = this->get_parameter("slope_max_deg").as_double();
-
-    const double ground_h_thr = this->get_parameter("ground_h_thr").as_double();
-    const double step_thr     = this->get_parameter("step_thr").as_double();
-    const double h_obs        = this->get_parameter("h_obs").as_double();
-
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored(new pcl::PointCloud<pcl::PointXYZRGB>);
-    pcl::PointCloud<pcl::PointXYZ>::Ptr ground(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::PointCloud<pcl::PointXYZ>::Ptr slope(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::PointCloud<pcl::PointXYZ>::Ptr step(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::PointCloud<pcl::PointXYZ>::Ptr obstacle(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::PointCloud<pcl::PointXYZ>::Ptr unknown(new pcl::PointCloud<pcl::PointXYZ>);
-
     colored->points.reserve(cloud->points.size());
 
-    for(const auto& kv : cells){
-      const Cell& c = kv.second;
-
-      for(int idx : c.indices){
-        const auto& pt = cloud->points[idx];
-
-        //デフォルト：unknown(オレンジ)
-        uint8_t r=255, g=140, b=0;
-        bool is_unknown = true;
-
-        if(c.plane_on){
-          //z_pred：地面高さ
-          double z_pred;
-          if(plane_z_at_xy(c.n, c.d, (double)pt.x, (double)pt.y, z_pred)){
-            double h = (double)pt.z - z_pred;
-
-            is_unknown = false;
-
-            //斜面と見なす角度
-            bool is_slope = (c.tilt_deg > flat_max_deg);
-            //障害物と見なす角度
-            bool too_steep = (c.tilt_deg > slope_max_deg);
-
-            if(too_steep){
-              // if "support plane" is steep, treat everything as obstacle (safety)
-              r=255; g=0; b=0;
-              obstacle->points.push_back(pt);
-            }
-            else{
-              if(h >= h_obs){
-                r=255; g=0; b=0;   // obstacle
-                obstacle->points.push_back(pt);
-              }
-              else if(h >= step_thr){
-                r=255; g=0; b=255; // step (traversable)
-                step->points.push_back(pt);
-              }
-              else if(std::fabs(h) <= ground_h_thr){
-                if(is_slope){
-                  r=0; g=0; b=255; // slope
-                  slope->points.push_back(pt);
-                }else{
-                  r=0; g=255; b=0; // flat ground
-                  ground->points.push_back(pt);
-                }
-              }
-              else{
-                // slight mismatch points (e.g., vegetation low) -> mark as step-ish or unknown?
-                // Here: treat as step-ish if above 0, else ground.
-                if(h > 0.0){
-                  r=255; g=0; b=255;
-                  step->points.push_back(pt);
-                }else{
-                  r=0; g=255; b=0;
-                  ground->points.push_back(pt);
-                }
-              }
-            }
-          }
-        }
-
-        if(is_unknown){
-          unknown->points.push_back(pt);
-        }
-
-        pcl::PointXYZRGB prgb;
-        prgb.x = pt.x; prgb.y = pt.y; prgb.z = pt.z;
-        prgb.r = r; prgb.g = g; prgb.b = b;
-        colored->points.push_back(prgb);
-      }
+    for(const auto& pt : cloud->points){
+      pcl::PointXYZRGB prgb;
+      prgb.x = pt.x; prgb.y = pt.y; prgb.z = pt.z;
+      prgb.r = 255; prgb.g = 0; prgb.b = 0;
+      colored->points.push_back(prgb);
     }
+    finalize_cloud(colored);
 
-    colored->width = (uint32_t)colored->points.size();
-    colored->height = 1;
-    ground->width = (uint32_t)ground->points.size(); ground->height = 1;
-    slope->width = (uint32_t)slope->points.size(); slope->height = 1;
-    step->width  = (uint32_t)step->points.size();  step->height = 1;
-    obstacle->width = (uint32_t)obstacle->points.size(); obstacle->height = 1;
-    unknown->width = (uint32_t)unknown->points.size(); unknown->height = 1;
-
-    sensor_msgs::msg::PointCloud2 msg_col, msg_g, msg_s, msg_step, msg_obs, msg_unk;
+    sensor_msgs::msg::PointCloud2 msg_col;
     pcl::toROSMsg(*colored, msg_col);
-    pcl::toROSMsg(*ground,  msg_g);
-    pcl::toROSMsg(*slope,   msg_s);
-    pcl::toROSMsg(*step,    msg_step);
-    pcl::toROSMsg(*obstacle,msg_obs);
-    pcl::toROSMsg(*unknown, msg_unk);
-
     msg_col.header = in_msg.header;
-    msg_g.header   = in_msg.header;
-    msg_s.header   = in_msg.header;
-    msg_step.header= in_msg.header;
-    msg_obs.header = in_msg.header;
-    msg_unk.header = in_msg.header;
-
     pub_colored_->publish(msg_col);
-    pub_ground_->publish(msg_g);
-    pub_slope_->publish(msg_s);
-    pub_step_->publish(msg_step);
-    pub_obstacle_->publish(msg_obs);
-    pub_unknown_->publish(msg_unk);
+
+    sensor_msgs::msg::PointCloud2 msg_ng;
+    pcl::toROSMsg(*cloud, msg_ng);
+    msg_ng.header = in_msg.header;
+    pub_nonground_->publish(msg_ng);
+  }
+
+  double cluster_min_z(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cand_cloud,
+                       const std::vector<pcl::PointIndices>& cluster_indices,
+                       int k)
+  {
+    double mz = std::numeric_limits<double>::infinity();
+    for(int cand_idx : cluster_indices[k].indices){
+      const auto& p = cand_cloud->points[cand_idx];
+      if(!std::isfinite(p.z)) continue;
+      if((double)p.z < mz) mz = (double)p.z;
+    }
+    if(!std::isfinite(mz)){
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+    return mz;
   }
 
 private:
@@ -499,10 +702,7 @@ private:
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_colored_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_ground_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_slope_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_step_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_obstacle_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_unknown_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_nonground_;
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
@@ -517,3 +717,4 @@ int main(int argc, char** argv)
   rclcpp::shutdown();
   return 0;
 }
+
