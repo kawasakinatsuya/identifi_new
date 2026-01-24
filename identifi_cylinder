@@ -22,13 +22,14 @@
 #include <algorithm>
 #include <cmath>
 #include <unordered_set>
-
 #include <Eigen/Dense>
-
 #include <pcl/features/normal_3d.h>
-#include <pcl/segmentation/sac_segmentation_from_normals.h>
+#include <pcl/segmentation/sac_segmentation.h>
 #include <pcl/filters/extract_indices.h>
 #include <pcl/ModelCoefficients.h>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
+
 
 
 struct Cell
@@ -59,7 +60,7 @@ struct Cell
   bool big_obs  = false; // 乗り越え不可（赤）
   bool unknown = false;
 
-  bool trunk = false;
+  bool cylinder = false;
 };
 
 struct TimeCloud
@@ -145,9 +146,10 @@ public:
       "/cloud_registered", rclcpp::SensorDataQoS(),
       std::bind(&IdentificationNode::cloud_callback, this, std::placeholders::_1));
 
-    pub_colored_   = this->create_publisher<sensor_msgs::msg::PointCloud2>("/identification/colored", 10);
-    pub_ground_    = this->create_publisher<sensor_msgs::msg::PointCloud2>("/ground_cluster/ground", 10);
-    pub_nonground_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/ground_cluster/nonground", 10);
+    pub_colored_   = this->create_publisher<sensor_msgs::msg::PointCloud2>("/points_colored", 10);
+    pub_ground_    = this->create_publisher<sensor_msgs::msg::PointCloud2>("/ground", 10);
+    pub_unknown_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/unknown", 10);
+    pub_cylinder_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cylinder", 10);
 
     // frames
     this->declare_parameter("world_frame", "camera_init");
@@ -173,23 +175,23 @@ public:
     this->declare_parameter("extra_ground_size_ratio", 0.10);
 
     // ---- 追加：識別条件 ----
-    this->declare_parameter("flat_deg_max", 5.0);        // 平地とみなす最大角度
+    this->declare_parameter("flat_deg_max", 12.0);        // 平地とみなす最大角度
     this->declare_parameter("slope_deg_max", 30.0);      // 斜面とみなす最大角度
     this->declare_parameter("step_h_max", 0.15);         // 15cm
     this->declare_parameter("ref_search_radius", 1.0);   // [m] 近傍地面探索半径（ルール1用）
     this->declare_parameter("flat_ref_deg_max", 10.0);   // 近傍基準地面として使える傾き（<=10deg）
 
-    this->declare_parameter("trunk_enable", true);
-    this->declare_parameter("trunk_roi_radius", 0.35); 
-    this->declare_parameter("trunk_roi_z_min", -1.0);
-    this->declare_parameter("trunk_roi_z_max",  1.0);
-    this->declare_parameter("trunk_min_roi_points", 80);
-    this->declare_parameter("trunk_normal_k", 20); 
-    this->declare_parameter("trunk_dist_thresh", 0.05);
-    this->declare_parameter("trunk_radius_min", 0.03);
-    this->declare_parameter("trunk_radius_max", 0.25);
-    this->declare_parameter("trunk_min_inliers", 60);
-    this->declare_parameter("trunk_max_cells_per_frame", 60);
+    this->declare_parameter("cylinder_enable", true);
+    this->declare_parameter("cylinder_roi_radius", 0.25); 
+    this->declare_parameter("cylinder_roi_z_min", -1.0);
+    this->declare_parameter("cylinder_roi_z_max",  2.0);
+    this->declare_parameter("cylinder_min_roi_points", 80);
+    this->declare_parameter("cylinder_normal_k", 20); 
+    this->declare_parameter("cylinder_dist_thresh", 0.05);
+    this->declare_parameter("cylinder_radius_min", 0.03);
+    this->declare_parameter("cylinder_radius_max", 0.25);
+    this->declare_parameter("cylinder_min_inliers", 60);
+    this->declare_parameter("cylinder_max_cells_per_frame", 60);
 
     RCLCPP_INFO(this->get_logger(), "IdentificationNode initialized (min-z per cell + largest cluster + cell bool classification).");
   }
@@ -433,6 +435,45 @@ private:
       }
 
       if(!has_plane){
+        //周りのセルから情報を補間
+        bool found_ref = false;
+        Eigen::Vector3f n_ref = z_axis;
+        float d_ref = 0.0f;
+        float best_dist = std::numeric_limits<float>::infinity();
+        float xc = (float)(bx + (c.ix + 0.5) * cell_size);
+        float yc = (float)(by + (c.iy + 0.5) * cell_size);
+
+        for(int dy=-ref_range; dy<=ref_range; ++dy){
+            for(int dx=-ref_range; dx<=ref_range; ++dx){
+                auto it = cells.find({c.ix + dx, c.iy + dy});
+                if(it == cells.end()) continue;
+                const Cell& nb = it->second;
+                if(!nb.has_ground_plane) continue;
+                double dist = std::sqrt((double)(dx*dx + dy*dy)) * cell_size;
+                if(dist > ref_R) continue;
+                double tilt_nb = angle_deg(nb.n_ground, z_axis);
+                if(tilt_nb > flat_ref_deg_max) continue;
+                if((float)dist < best_dist){
+                    best_dist = (float)dist;
+                    n_ref = nb.n_ground;
+                    d_ref = nb.d_ground;
+                    found_ref = true;
+                }
+            }
+        }
+        if(found_ref){
+            float z_ref;
+            if(plane_z_at_xy(n_ref, d_ref, xc, yc, z_ref)){
+                double dz = std::abs(c.z_max - (double)z_ref);
+                if(dz <= step_h_max){
+                    c.small_obs = true; 
+                }
+                else{
+                    c.big_obs = true;
+                }
+                continue;
+            }
+        }
         c.unknown = true;
         continue;
       }
@@ -509,47 +550,66 @@ private:
       }
     }
 
-    const bool trunk_enable = this->get_parameter("trunk_enable").as_bool();
-    if(trunk_enable){
-      const double roi_R = this->get_parameter("trunk_roi_radius").as_double();
-      const double roi_zmin = this->get_parameter("trunk_roi_z_min").as_double();
-      const double roi_zmax = this->get_parameter("trunk_roi_z_max").as_double();
-      const int min_roi_pts = this->get_parameter("trunk_min_roi_points").as_int();
-      const int normal_k = this->get_parameter("trunk_normal_k").as_int();
-      const double dist_th = this->get_parameter("trunk_dist_thresh").as_double();
-      const double r_min = this->get_parameter("trunk_radius_min").as_double();
-      const double r_max = this->get_parameter("trunk_radius_max").as_double();
-      const int min_inliers   = this->get_parameter("trunk_min_inliers").as_int();
-      const int max_cells     = this->get_parameter("trunk_max_cells_per_frame").as_int();
+    const bool cylinder_enable = this->get_parameter("cylinder_enable").as_bool();
+    if(cylinder_enable){
+      const double roi_R = this->get_parameter("cylinder_roi_radius").as_double();
+      const double roi_zmin = this->get_parameter("cylinder_roi_z_min").as_double();
+      const double roi_zmax = this->get_parameter("cylinder_roi_z_max").as_double();
+      const int min_roi_pts = this->get_parameter("cylinder_min_roi_points").as_int();
+      const int normal_k = this->get_parameter("cylinder_normal_k").as_int();
+      const double dist_th = this->get_parameter("cylinder_dist_thresh").as_double();
+      const double r_min = this->get_parameter("cylinder_radius_min").as_double();
+      const double r_max = this->get_parameter("cylinder_radius_max").as_double();
+      const int min_inliers   = this->get_parameter("cylinder_min_inliers").as_int();
+      const int max_cells     = this->get_parameter("cylinder_max_cells_per_frame").as_int();
+
+      const float front_min_x = 0.0f;
+      const float front_max_x = 2.0f;
+      const float side_max_y  = 0.5f;
       pcl::search::KdTree<pcl::PointXYZ>::Ptr kdtree(new pcl::search::KdTree<pcl::PointXYZ>);
       kdtree->setInputCloud(cloud_map);
+      for(auto& kv : cells){
+        kv.second.cylinder = false;
+      }
+      tf2::Quaternion q(tf_w_b.transform.rotation.x,tf_w_b.transform.rotation.y, tf_w_b.transform.rotation.z, tf_w_b.transform.rotation.w  );
+      tf2::Matrix3x3 R(q);
       int processed = 0;
       int detected  = 0;
       for(auto& kv : cells){
         if(processed >= max_cells) break;
         Cell& c = kv.second;
-        c.trunk = false;
         if(!(c.big_obs || c.small_obs)) continue;
         float xc = (float)(bx + (c.ix + 0.5) * cell_size);
         float yc = (float)(by + (c.iy + 0.5) * cell_size);
+        // セル中心を base座標に変換して前方矩形でフィルタ
+        tf2::Vector3 pw(xc - (float)bx, yc - (float)by, 0.0f);
+        tf2::Vector3 pb = R.transpose() * pw;
+        float x_base = (float)pb.x();
+        float y_base = (float)pb.y();
+        if(x_base < front_min_x) continue;
+        if(x_base > front_max_x) continue;
+        if(std::abs(y_base) > side_max_y) continue;
         processed++;
-        bool ok = detect_cylinder_in_roi(cloud_map, kdtree, xc, yc, (float)roi_R, (float)roi_zmin, (float)roi_zmax, min_roi_pts, normal_k, (float)dist_th, (float)r_min, (float)r_max, min_inliers);
+        bool ok = detect_cylinder_in_roi(cloud_map, kdtree,xc, yc, (float)roi_R, (float)roi_zmin, (float)roi_zmax, min_roi_pts, normal_k, (float)dist_th, (float)r_min, (float)r_max, min_inliers);
         if(ok){
           detected++;
-          c.trunk = true;
+          c.cylinder = true;
         }
       }
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,"cylinder: processed=%d detected=%d", processed, detected);
     }
 
     // -------- publish clouds --------
-    pcl::PointCloud<pcl::PointXYZ>::Ptr ground(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::PointCloud<pcl::PointXYZ>::Ptr nonground(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr ground(new pcl::PointCloud<pcl::PointXYZRGB>);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr unknown(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cylinder(new pcl::PointCloud<pcl::PointXYZRGB>);
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored(new pcl::PointCloud<pcl::PointXYZRGB>);
 
     ground->points.reserve(cloud_map->points.size());
-    nonground->points.reserve(cloud_map->points.size());
+    unknown->points.reserve(cloud_map->points.size());
     colored->points.reserve(cloud_map->points.size());
-
+    cylinder->points.reserve(cloud_map->points.size());
+    
     auto cell_key_of_point = [&](const pcl::PointXYZ& pt)->std::pair<int,int>{
       double xl = (double)pt.x - bx;
       double yl = (double)pt.y - by;
@@ -561,62 +621,98 @@ private:
     for(int i = 0; i < (int)cloud_map->points.size(); ++i){
       const auto& pt = cloud_map->points[i];
 
-      pcl::PointXYZRGB prgb;
-      prgb.x = pt.x; prgb.y = pt.y; prgb.z = pt.z;
+      pcl::PointXYZRGB p_ground, p_cyl, p_all;
+      p_ground.x = p_cyl.x = p_all.x = pt.x;
+      p_ground.y = p_cyl.y = p_all.y = pt.y;
+      p_ground.z = p_cyl.z = p_all.z = pt.z;
 
       auto key = cell_key_of_point(pt);
       auto it  = cells.find(key);
 
-      if(it != cells.end()){
+      bool is_cylinder = false;
+      bool is_ground = false;
+      bool is_slope = false;  
+      bool is_small_obs = false;
+      bool is_big_obs = false;
+
+      if(it == cells.end()){
+        unknown->points.push_back(pt); 
+        p_all.r = 255; p_all.g = 0; p_all.b = 255; 
+        colored->points.push_back(p_all);
+        continue;
+      }
+      else{
         const Cell& c = it->second;
+        is_cylinder = c.cylinder;
+        is_ground = c.ground;
+        is_slope = c.slope;
+        is_small_obs = c.small_obs;
+        is_big_obs = c.big_obs;
       }
 
-      if(c.ground){
+      if(ground_set.find(i) != ground_set.end()){
+        p_ground.r = 255; p_ground.g = 0;   p_ground.b = 0;
+      }
+      else{
+        p_ground.r = 255; p_ground.g = 255; p_ground.b = 255;
+      }
+      ground->points.push_back(p_ground);
+
+      if(is_cylinder){
+        p_cyl.r = 255; p_cyl.g = 0; p_cyl.b = 0;
+      }
+      else{
+        p_cyl.r = 255; p_cyl.g = 255; p_cyl.b = 255;
+      }
+      cylinder->points.push_back(p_cyl);
+
+      if(is_ground){
         // ground = green
-        prgb.r = 0; prgb.g = 255; prgb.b = 0;
-        ground->points.push_back(pt);
+        p_all.r = 0; p_all.g = 255; p_all.b = 0;
       }else{
-        if(c.trunk){
+        if(is_cylinder){
           //pink
-          prgb.r = 255; prgb.g = 153; prgb.b = 153;
+          p_all.r = 255; p_all.g = 153; p_all.b = 153;
         }
-        if(c.slope){
+        else if(is_slope){
           // slope = cyan
-          prgb.r = 0; prgb.g = 255; prgb.b = 255;
-        }else if(c.small_obs){
+          p_all.r = 0; p_all.g = 255; p_all.b = 255;
+        }else if(is_small_obs){
           // traversable obstacle = yellow
-          prgb.r = 255; prgb.g = 255; prgb.b = 0;
-        }else if(c.big_obs){
+          p_all.r = 255; p_all.g = 255; p_all.b = 0;
+        }else if(is_big_obs){
           // blocked obstacle = red
-          prgb.r = 255; prgb.g = 0; prgb.b = 0;
+          p_all.r = 255; p_all.g = 0; p_all.b = 0;
         }else{
           //purple
-          prgb.r = 255; prgb.g = 0; prgb.b = 255;
+          p_all.r = 255; p_all.g = 0; p_all.b = 255;
+          unknown->points.push_back(pt);
         }
-        nonground->points.push_back(pt);
       }
+      colored->points.push_back(p_all);
 
-      colored->points.push_back(prgb);
     }
 
-
-
     finalize_cloud(ground);
-    finalize_cloud(nonground);
+    finalize_cloud(unknown);
     finalize_cloud(colored);
+    finalize_cloud(cylinder);.....
 
-    sensor_msgs::msg::PointCloud2 msg_col, msg_g, msg_ng;
+    sensor_msgs::msg::PointCloud2 msg_col, msg_g, msg_ng, msg_cy;
     pcl::toROSMsg(*colored, msg_col);
     pcl::toROSMsg(*ground, msg_g);
-    pcl::toROSMsg(*nonground, msg_ng);
+    pcl::toROSMsg(*unknown, msg_ng);
+    pcl::toROSMsg(*cylinder, msg_cy);
 
     msg_col.header = msg->header;
     msg_g.header   = msg->header;
     msg_ng.header  = msg->header;
+    msg_cy.header  = msg->header;
 
     pub_colored_->publish(msg_col);
     pub_ground_->publish(msg_g);
-    pub_nonground_->publish(msg_ng);
+    pub_unknown_->publish(msg_ng);
+    pub_cylinder_->publish(msg_cy);
 
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
       "map=%zu cand=%zu clusters=%zu ground_set=%zu out_ground=%zu",
@@ -717,15 +813,13 @@ private:
   {
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored(new pcl::PointCloud<pcl::PointXYZRGB>);
     colored->points.reserve(cloud->points.size());
-
     for(const auto& pt : cloud->points){
-      pcl::PointXYZRGB prgb;
-      prgb.x = pt.x; prgb.y = pt.y; prgb.z = pt.z;
-      prgb.r = 255; prgb.g = 0; prgb.b = 0;
-      colored->points.push_back(prgb);
+        pcl::PointXYZRGB p;
+        p.x = pt.x; p.y = pt.y; p.z = pt.z;
+        p.r = 255; p.g = 255; p.b = 255;
+        colored->points.push_back(p);
     }
     finalize_cloud(colored);
-
     sensor_msgs::msg::PointCloud2 msg_col;
     pcl::toROSMsg(*colored, msg_col);
     msg_col.header = in_msg.header;
@@ -734,7 +828,7 @@ private:
     sensor_msgs::msg::PointCloud2 msg_ng;
     pcl::toROSMsg(*cloud, msg_ng);
     msg_ng.header = in_msg.header;
-    pub_nonground_->publish(msg_ng);
+    pub_unknown_->publish(msg_ng);
   }
 
   double cluster_min_z(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cand_cloud,
@@ -808,7 +902,8 @@ private:
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_colored_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_ground_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_nonground_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_unknown_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cylinder_;
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
