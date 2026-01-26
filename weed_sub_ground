@@ -1,0 +1,598 @@
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/filter.h>
+
+#include <pcl/kdtree/kdtree.h>
+#include <pcl/segmentation/extract_clusters.h>
+
+#include <deque>
+#include <vector>
+#include <limits>
+#include <cmath>
+#include <unordered_map>
+#include <unordered_set>
+#include <algorithm>
+
+#include <Eigen/Dense>
+
+// ---------------------
+// Buffer element
+// ---------------------
+struct TimeCloud
+{
+  rclcpp::Time stamp;
+  pcl::PointCloud<pcl::PointXYZ>::Ptr cloud;
+};
+
+// pack key
+static inline uint64_t pack2i(int a, int b)
+{
+  return (uint64_t)(uint32_t)a << 32 | (uint32_t)b;
+}
+
+// ---------------------
+// helper: fixed color from id
+// ---------------------
+static inline void color_from_id(int id, uint8_t& r, uint8_t& g, uint8_t& b)
+{
+  uint32_t x = (uint32_t)id * 2654435761u;  // Knuth hash
+  r = (uint8_t)((x >>  0) & 0xFF);
+  g = (uint8_t)((x >>  8) & 0xFF);
+  b = (uint8_t)((x >> 16) & 0xFF);
+
+  if((int)r + (int)g + (int)b < 120){
+    r = (uint8_t)std::min(255, (int)r + 80);
+    g = (uint8_t)std::min(255, (int)g + 80);
+    b = (uint8_t)std::min(255, (int)b + 80);
+  }
+}
+
+// PCA scattering (0~1, 大きいほど散らばり)
+static inline bool pca_scattering(
+  const pcl::PointCloud<pcl::PointXYZ>& cloud,
+  const std::vector<int>& indices,
+  double& scattering_out)
+{
+  if((int)indices.size() < 15) return false;
+
+  Eigen::Vector3d mean(0,0,0);
+  int cnt = 0;
+  for(int idx : indices){
+    const auto& p = cloud.points[idx];
+    if(!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+    mean += Eigen::Vector3d(p.x, p.y, p.z);
+    cnt++;
+  }
+  if(cnt < 15) return false;
+  mean /= (double)cnt;
+
+  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+  for(int idx : indices){
+    const auto& p = cloud.points[idx];
+    if(!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+    Eigen::Vector3d q(p.x, p.y, p.z);
+    Eigen::Vector3d d = q - mean;
+    cov += d * d.transpose();
+  }
+  cov /= (double)cnt;
+
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov);
+  if(es.info() != Eigen::Success) return false;
+
+  // λ0 <= λ1 <= λ2
+  Eigen::Vector3d eval = es.eigenvalues();
+  double l0 = std::max(1e-12, eval(0));
+  double l1 = std::max(1e-12, eval(1));
+  double l2 = std::max(1e-12, eval(2));
+  double sum = l0 + l1 + l2;
+
+  // scattering: 小さい軸の割合
+  scattering_out = l0 / sum;
+  return std::isfinite(scattering_out);
+}
+
+class WeedNode : public rclcpp::Node
+{
+public:
+  WeedNode() : Node("weed_node")
+  {
+    // ---- params ----
+    this->declare_parameter("input_topic", "/cloud_registered");
+    this->declare_parameter("ground_topic", "/cell_ground");
+
+    this->declare_parameter("short_window", 0.30);          // [s]
+    this->declare_parameter("short_voxel",  0.05);          // [m]
+    this->declare_parameter("range_max",    0.0);           // [m] 0 = no limit
+
+    this->declare_parameter("cluster_tolerance", 0.07);     // [m]
+    this->declare_parameter("min_cluster_size",  30);       // [pts]
+    this->declare_parameter("max_cluster_size",  200000);   // [pts]
+
+    this->declare_parameter("publish_raw_short_cloud", false);
+
+    // ---- ground map params ----
+    this->declare_parameter("ground_cell_size", 0.20);      // Identification側セルサイズ
+    this->declare_parameter("weed_cell_size",   0.05);      // Weed側セルサイズ
+
+    // ---- bands ratios ----
+    this->declare_parameter("bot_ratio", 0.30);
+    this->declare_parameter("mid_lo_ratio", 0.45);
+    this->declare_parameter("mid_hi_ratio", 0.55);
+    this->declare_parameter("top_ratio", 0.70);
+
+    // ---- weed decision thresholds ----
+    this->declare_parameter("min_h", 0.08);                 // hが小さすぎるクラスタは対象外
+    this->declare_parameter("low_ratio_max", 0.50);         // 下層点が少ない
+    this->declare_parameter("mid_ratio_max", 0.05);         // 中層点が少ない
+    this->declare_parameter("scatter_min", 0.16);           // PCA散らばり閾値
+    this->declare_parameter("min_points_for_pca", 40);
+
+    // ---- pub/sub ----
+    const std::string input_topic  = this->get_parameter("input_topic").as_string();
+    const std::string ground_topic = this->get_parameter("ground_topic").as_string();
+
+    sub_cloud_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+      input_topic, rclcpp::SensorDataQoS(),
+      std::bind(&WeedNode::cb_cloud, this, std::placeholders::_1));
+
+    sub_ground_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+      ground_topic, 10,
+      std::bind(&WeedNode::cb_ground, this, std::placeholders::_1));
+
+    pub_weed_colored_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+      "/weed_colored", 10);
+
+    pub_short_cloud_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+      "/short_cloud", 10);
+
+    pub_cluster_colored_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+      "/cluster_colored", 10);
+    
+    pub_weed_points_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+      "/weed_points", 10);
+
+
+    RCLCPP_INFO(this->get_logger(),
+      "weed_node started. sub=%s ground=%s pub=/weed_colored",
+      input_topic.c_str(), ground_topic.c_str());
+  }
+
+private:
+  // ---------------------------
+  // ground callback
+  // ---------------------------
+  void cb_ground(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+  {
+    pcl::PointCloud<pcl::PointXYZ>::Ptr g(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::fromROSMsg(*msg, *g);
+
+    double gcell = this->get_parameter("ground_cell_size").as_double();
+
+    std::unordered_map<uint64_t, float> new_map;
+    new_map.reserve(g->points.size() * 2);
+
+    for(const auto& p : g->points){
+      if(!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+      int ix = (int)std::floor((double)p.x / gcell);
+      int iy = (int)std::floor((double)p.y / gcell);
+      new_map[pack2i(ix,iy)] = (float)p.z;
+    }
+
+    ground_map_ = std::move(new_map);
+    has_ground_map_ = !ground_map_.empty();
+
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+      "ground_map updated: cells=%zu", ground_map_.size());
+  }
+
+  // ground z lookup (20cm map -> nearest)
+  bool lookup_ground_z(double x, double y, float& z_out) const
+  {
+    if(!has_ground_map_) return false;
+
+    double gcell = this->get_parameter("ground_cell_size").as_double();
+    int ix = (int)std::floor(x / gcell);
+    int iy = (int)std::floor(y / gcell);
+
+    auto it = ground_map_.find(pack2i(ix,iy));
+    if(it != ground_map_.end()){
+      z_out = it->second;
+      return true;
+    }
+
+    // fallback: search neighbors (1 ring)
+    float best_d2 = std::numeric_limits<float>::infinity();
+    bool found = false;
+
+    for(int dy=-1; dy<=1; ++dy){
+      for(int dx=-1; dx<=1; ++dx){
+        auto jt = ground_map_.find(pack2i(ix+dx, iy+dy));
+        if(jt == ground_map_.end()) continue;
+
+        double cx = (double)(ix+dx + 0.5) * gcell;
+        double cy = (double)(iy+dy + 0.5) * gcell;
+        float d2 = (float)((x-cx)*(x-cx) + (y-cy)*(y-cy));
+        if(d2 < best_d2){
+          best_d2 = d2;
+          z_out = jt->second;
+          found = true;
+        }
+      }
+    }
+    return found;
+  }
+
+  // ---------------------------
+  // cloud callback
+  // ---------------------------
+  void cb_cloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+  {
+    // ---- ROS msg -> PCL ----
+    pcl::PointCloud<pcl::PointXYZ>::Ptr in(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::fromROSMsg(*msg, *in);
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_filtered(new pcl::PointCloud<pcl::PointXYZ>);
+    std::vector<int> nan_indices;
+    pcl::removeNaNFromPointCloud(*in, *cloud_filtered, nan_indices);
+
+    // optional range filter
+    double range_max = this->get_parameter("range_max").as_double();
+    if(range_max > 0.0){
+      pcl::PointCloud<pcl::PointXYZ>::Ptr ranged(new pcl::PointCloud<pcl::PointXYZ>);
+      ranged->points.reserve(cloud_filtered->points.size());
+      for(const auto& p : cloud_filtered->points){
+        double r = std::sqrt((double)p.x*p.x + (double)p.y*p.y);
+        if(r <= range_max){
+          ranged->points.push_back(p);
+        }
+      }
+      ranged->width = (uint32_t)ranged->points.size();
+      ranged->height = 1;
+      ranged->is_dense = true;
+      cloud_filtered = ranged;
+    }
+
+    // downsample single frame
+    double short_voxel = this->get_parameter("short_voxel").as_double();
+    pcl::PointCloud<pcl::PointXYZ>::Ptr down = voxel_downsample(cloud_filtered, short_voxel);
+
+    rclcpp::Time stamp(msg->header.stamp);
+
+    // push into short buffer
+    TimeCloud tc;
+    tc.stamp = stamp;
+    tc.cloud = down;
+    short_buffer_.push_back(tc);
+
+    // pop old
+    double short_window = this->get_parameter("short_window").as_double();
+    pop_old(short_buffer_, stamp, short_window);
+
+    // build merged short cloud
+    pcl::PointCloud<pcl::PointXYZ>::Ptr short_merged = build_map(short_buffer_);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr short_cloud  = voxel_downsample(short_merged, short_voxel);
+
+    if(short_cloud->points.size() < 200){
+      return;
+    }
+
+    // optional publish raw short cloud
+    bool pub_raw = this->get_parameter("publish_raw_short_cloud").as_bool();
+    if(pub_raw){
+      sensor_msgs::msg::PointCloud2 out_raw;
+      pcl::toROSMsg(*short_cloud, out_raw);
+      out_raw.header = msg->header;
+      pub_short_cloud_->publish(out_raw);
+    }
+
+    // clustering
+    std::vector<pcl::PointIndices> clusters;
+    euclidean_cluster(short_cloud, clusters);
+
+    // label array
+    std::vector<int> label(short_cloud->points.size(), -1);
+    for(int cid = 0; cid < (int)clusters.size(); ++cid){
+      for(int idx : clusters[cid].indices){
+        if(idx >= 0 && idx < (int)label.size()){
+          label[idx] = cid;
+        }
+      }
+    }
+
+    // ---------------------------
+    // weed decision per cluster
+    // ---------------------------
+    std::vector<bool> is_weed_cluster(clusters.size(), false);
+
+    // bands ratios
+    double bot_ratio    = this->get_parameter("bot_ratio").as_double();
+    double mid_lo_ratio = this->get_parameter("mid_lo_ratio").as_double();
+    double mid_hi_ratio = this->get_parameter("mid_hi_ratio").as_double();
+    double top_ratio    = this->get_parameter("top_ratio").as_double();
+
+    // thresholds
+    double min_h = this->get_parameter("min_h").as_double();
+    double low_ratio_max = this->get_parameter("low_ratio_max").as_double();
+    double mid_ratio_max = this->get_parameter("mid_ratio_max").as_double();
+    double scatter_min = this->get_parameter("scatter_min").as_double();
+    int min_points_for_pca = this->get_parameter("min_points_for_pca").as_int();
+
+    double wcell = this->get_parameter("weed_cell_size").as_double();
+
+    for(int cid = 0; cid < (int)clusters.size(); ++cid)
+    {
+      const auto& idxs = clusters[cid].indices;
+      if((int)idxs.size() < 30) continue;
+
+      // max height point
+      int best_i = -1;
+      double zmax = -1e9;
+      for(int i : idxs){
+        const auto& p = short_cloud->points[i];
+        if(!std::isfinite(p.z)) continue;
+        if((double)p.z > zmax){
+          zmax = (double)p.z;
+          best_i = i;
+        }
+      }
+      if(best_i < 0) continue;
+
+      const auto& pmax = short_cloud->points[best_i];
+
+      float gz_max;
+      if(!lookup_ground_z((double)pmax.x, (double)pmax.y, gz_max)){
+        // ground mapが無いなら雑草判定しない
+        continue;
+      }
+
+      double h = zmax - (double)gz_max;
+      if(!std::isfinite(h) || h < min_h) continue;
+
+      // count bands
+      int cnt_bot = 0, cnt_mid = 0, cnt_top = 0;
+      int cnt_all = 0;
+
+      // 5cmセル単位の「占有」も見る（オプション的に効く）
+      std::unordered_set<uint64_t> occ_bot, occ_mid, occ_top;
+      occ_bot.reserve(idxs.size()/2);
+      occ_mid.reserve(idxs.size()/2);
+      occ_top.reserve(idxs.size()/2);
+
+      for(int i : idxs){
+        const auto& p = short_cloud->points[i];
+        float gz;
+        if(!lookup_ground_z((double)p.x, (double)p.y, gz)) continue;
+
+        double zrel = (double)p.z - (double)gz;
+        if(!std::isfinite(zrel)) continue;
+        if(zrel < 0.0) zrel = 0.0;
+        if(zrel > h) zrel = h;
+
+        double t = zrel / h;
+
+        // 5cm cell key
+        int ix5 = (int)std::floor((double)p.x / wcell);
+        int iy5 = (int)std::floor((double)p.y / wcell);
+        uint64_t key5 = pack2i(ix5, iy5);
+
+        cnt_all++;
+        if(t <= bot_ratio){
+          cnt_bot++;
+          occ_bot.insert(key5);
+        }else if(t >= mid_lo_ratio && t <= mid_hi_ratio){
+          cnt_mid++;
+          occ_mid.insert(key5);
+        }else if(t >= top_ratio){
+          cnt_top++;
+          occ_top.insert(key5);
+        }
+      }
+
+      if(cnt_all < 20) continue;
+
+      double bot_ratio_pts = (double)cnt_bot / (double)cnt_all;
+      double mid_ratio_pts = (double)cnt_mid / (double)cnt_all;
+
+      // PCA scattering
+      double scattering = 0.0;
+      bool ok_pca = false;
+      if((int)idxs.size() >= min_points_for_pca){
+        ok_pca = pca_scattering(*short_cloud, idxs, scattering);
+      }
+
+      // weed rule:
+      //  - 下層/中層に点が少ない
+      //  - PCA散らばりが大きい（葉で散る）
+      bool weed = false;
+      if(ok_pca){
+        if(mid_ratio_pts < mid_ratio_max &&
+           scattering >= scatter_min){
+          weed = true;
+        }
+      }
+
+      is_weed_cluster[cid] = weed;
+    }
+
+    // ---------------------------
+    // colorize points
+    // ---------------------------
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored(new pcl::PointCloud<pcl::PointXYZRGB>);
+    colored->points.reserve(short_cloud->points.size());
+
+    for(int i = 0; i < (int)short_cloud->points.size(); ++i){
+      const auto& p = short_cloud->points[i];
+      pcl::PointXYZRGB q;
+      q.x = p.x; q.y = p.y; q.z = p.z;
+
+      int cid = label[i];
+      if(cid < 0){
+        // non-cluster: gray
+        q.r = 200; q.g = 200; q.b = 200;
+      }else{
+        if(is_weed_cluster[cid]){
+          // WEED: red
+          q.r = 255; q.g = 0; q.b = 0;
+        }else{
+          // NOT weed: white
+          q.r = 255; q.g = 255; q.b = 255;
+        }
+      }
+      colored->points.push_back(q);
+    }
+
+    colored->width  = (uint32_t)colored->points.size();
+    colored->height = 1;
+    colored->is_dense = true;
+
+    sensor_msgs::msg::PointCloud2 out;
+    pcl::toROSMsg(*colored, out);
+    out.header = msg->header;
+    pub_weed_colored_->publish(out);
+
+    // ---------------------------
+// publish cluster-colored cloud (by cluster id)
+// ---------------------------
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cluster_colored(new pcl::PointCloud<pcl::PointXYZRGB>);
+    cluster_colored->points.reserve(short_cloud->points.size());
+
+    for(int i = 0; i < (int)short_cloud->points.size(); ++i)
+    {
+      const auto& p = short_cloud->points[i];
+      pcl::PointXYZRGB q;
+      q.x = p.x; q.y = p.y; q.z = p.z;
+      
+      int cid = label[i];
+      if(cid < 0){
+        q.r = 160; q.g = 160; q.b = 160;  // non-cluster
+      }
+      else{
+        uint8_t r,g,b;
+        color_from_id(cid, r, g, b);
+        q.r = r; q.g = g; q.b = b;
+      }
+      cluster_colored->points.push_back(q);
+    }
+    cluster_colored->width  = (uint32_t)cluster_colored->points.size();
+    cluster_colored->height = 1;
+    cluster_colored->is_dense = true;
+
+    sensor_msgs::msg::PointCloud2 out_cluster;
+    pcl::toROSMsg(*cluster_colored, out_cluster);
+    out_cluster.header = msg->header;
+    pub_cluster_colored_->publish(out_cluster);
+
+
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+      "short pts=%zu clusters=%zu weed=%zu ground_map=%d",
+      short_cloud->points.size(), clusters.size(),
+      std::count(is_weed_cluster.begin(), is_weed_cluster.end(), true),
+      (int)has_ground_map_);
+
+      
+    pcl::PointCloud<pcl::PointXYZ>::Ptr weed_points(new pcl::PointCloud<pcl::PointXYZ>);
+    weed_points->points.reserve(short_cloud->points.size());
+
+    for(int i = 0; i < (int)short_cloud->points.size(); ++i){
+      int cid = label[i];
+      if(cid < 0) continue;
+      if(!is_weed_cluster[cid]) continue;
+
+      const auto& p = short_cloud->points[i];
+      weed_points->points.push_back(p);
+    }
+
+    weed_points->width  = (uint32_t)weed_points->points.size();
+    weed_points->height = 1;
+    weed_points->is_dense = true;
+    sensor_msgs::msg::PointCloud2 out_weed;
+    pcl::toROSMsg(*weed_points, out_weed);
+    out_weed.header = msg->header;
+    pub_weed_points_->publish(out_weed);
+  }
+
+  // ---------- helpers ----------
+  static void pop_old(std::deque<TimeCloud>& buf, const rclcpp::Time& now, double window)
+  {
+    while(!buf.empty()){
+      double dt = (now - buf.front().stamp).seconds();
+      if(dt <= window) break;
+      buf.pop_front();
+    }
+  }
+
+  static pcl::PointCloud<pcl::PointXYZ>::Ptr build_map(const std::deque<TimeCloud>& buf)
+  {
+    pcl::PointCloud<pcl::PointXYZ>::Ptr merged(new pcl::PointCloud<pcl::PointXYZ>);
+    for(const auto& tc : buf){
+      *merged += *(tc.cloud);
+    }
+    merged->width = (uint32_t)merged->points.size();
+    merged->height = 1;
+    merged->is_dense = true;
+    return merged;
+  }
+
+  static pcl::PointCloud<pcl::PointXYZ>::Ptr voxel_downsample(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& input, double vx)
+  {
+    pcl::VoxelGrid<pcl::PointXYZ> voxel;
+    voxel.setInputCloud(input);
+    voxel.setLeafSize((float)vx, (float)vx, (float)vx);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr out(new pcl::PointCloud<pcl::PointXYZ>);
+    voxel.filter(*out);
+    return out;
+  }
+
+  void euclidean_cluster(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    std::vector<pcl::PointIndices>& cluster_indices)
+  {
+    cluster_indices.clear();
+
+    const double tol = this->get_parameter("cluster_tolerance").as_double();
+    const int min_sz = this->get_parameter("min_cluster_size").as_int();
+    const int max_sz = this->get_parameter("max_cluster_size").as_int();
+
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    tree->setInputCloud(cloud);
+
+    pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+    ec.setClusterTolerance(tol);
+    ec.setMinClusterSize(min_sz);
+    ec.setMaxClusterSize(max_sz);
+    ec.setSearchMethod(tree);
+    ec.setInputCloud(cloud);
+    ec.extract(cluster_indices);
+  }
+
+private:
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_cloud_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_ground_;
+
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_weed_colored_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_short_cloud_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cluster_colored_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_weed_points_;
+
+
+  std::deque<TimeCloud> short_buffer_;
+
+  // ground map (20cm)
+  std::unordered_map<uint64_t, float> ground_map_;
+  bool has_ground_map_ = false;
+};
+
+int main(int argc, char** argv)
+{
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<WeedNode>());
+  rclcpp::shutdown();
+  return 0;
+}
