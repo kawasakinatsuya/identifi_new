@@ -180,6 +180,58 @@ static inline bool fit_rep_normal_knn30(const pcl::PointCloud<pcl::PointXYZ>::Pt
   return true;
 }
 
+static std::pair<int,int> cell_key_of_point(const pcl::PointXYZ& pt, double bx, double by, double cell_size)
+{
+  double xl = (double)pt.x - bx;
+  double yl = (double)pt.y - by;
+  int ix = (int)std::floor(xl / cell_size);
+  int iy = (int)std::floor(yl / cell_size);
+  return {ix, iy};
+}
+
+static bool search_nearest_ground_plane(
+    const std::map<std::pair<int,int>, Cell>& cells,
+    int ix, int iy,
+    int ref_range,
+    double cell_size,
+    double ref_R,
+    bool require_flat,
+    double flat_ref_deg_max,
+    Eigen::Vector3f& n_ref,
+    float& d_ref)
+{
+  const Eigen::Vector3f z_axis(0,0,1);
+
+  bool found = false;
+  float best_dist = std::numeric_limits<float>::infinity();
+
+  for(int dy = -ref_range; dy <= ref_range; ++dy){
+    for(int dx = -ref_range; dx <= ref_range; ++dx){
+      auto it = cells.find({ix + dx, iy + dy});
+      if(it == cells.end()) continue;
+
+      const Cell& nb = it->second;
+      if(!nb.has_ground_plane) continue;
+
+      double dist = std::sqrt((double)(dx*dx + dy*dy)) * cell_size;
+      if(dist > ref_R) continue;
+
+      if(require_flat){
+        double tilt = angle_deg(nb.n_ground, z_axis);
+        if(tilt > flat_ref_deg_max) continue;
+      }
+
+      if((float)dist < best_dist){
+        best_dist = (float)dist;
+        n_ref = nb.n_ground;
+        d_ref = nb.d_ground;
+        found = true;
+      }
+    }
+  }
+  return found;
+}
+
 class IdentificationNode : public rclcpp::Node
 {
 public:
@@ -678,13 +730,14 @@ private:
         kv.second.cylinder = false;
       }
 
-      tf2::Quaternion q(tf_w_b.transform.rotation.x, tf_w_b.transform.rotation.y,
-                        tf_w_b.transform.rotation.z, tf_w_b.transform.rotation.w);
+      //tfで得た姿勢を回転行列に変換
+      tf2::Quaternion q(tf_w_b.transform.rotation.x, tf_w_b.transform.rotation.y, tf_w_b.transform.rotation.z, tf_w_b.transform.rotation.w);
       tf2::Matrix3x3 R(q);
 
       int processed = 0;
       int detected  = 0;
 
+      //障害物や段差のセルを対象に円柱検出
       for(auto& kv : cells){
         if(processed >= max_cells) break;
         Cell& c = kv.second;
@@ -694,7 +747,7 @@ private:
         float xc = (float)(bx + (c.ix + 0.5) * cell_size);
         float yc = (float)(by + (c.iy + 0.5) * cell_size);
 
-        // セル中心を base座標に変換して前方矩形でフィルタ
+        // セル中心を base座標に変換
         tf2::Vector3 pw(xc - (float)bx, yc - (float)by, 0.0f);
         tf2::Vector3 pb = R.transpose() * pw;
 
@@ -706,8 +759,7 @@ private:
 
         processed++;
 
-        bool ok = detect_cylinder_in_roi(
-          cloud_map, kdtree, xc, yc,
+        bool ok = detect_cylinder_in_roi(cloud_map, kdtree, xc, yc,
           (float)roi_R, (float)roi_zmin, (float)roi_zmax,
           min_roi_pts, normal_k, (float)dist_th, (float)r_min, (float)r_max,
           min_inliers);
@@ -717,9 +769,6 @@ private:
           c.cylinder = true;
         }
       }
-
-      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                           "cylinder: processed=%d detected=%d", processed, detected);
     }
 
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr ground(new pcl::PointCloud<pcl::PointXYZRGB>);
@@ -731,14 +780,6 @@ private:
     unknown->points.reserve(cloud_map->points.size());
     colored->points.reserve(cloud_map->points.size());
     cylinder->points.reserve(cloud_map->points.size());
-
-    auto cell_key_of_point = [&](const pcl::PointXYZ& pt)->std::pair<int,int>{
-      double xl = (double)pt.x - bx;
-      double yl = (double)pt.y - by;
-      int ix = (int)std::floor(xl / cell_size);
-      int iy = (int)std::floor(yl / cell_size);
-      return {ix, iy};
-    };
 
     pcl::PointCloud<pcl::PointXYZ>::Ptr weed_cloud_local(new pcl::PointCloud<pcl::PointXYZ>);
     pcl::search::KdTree<pcl::PointXYZ>::Ptr weed_kdtree_local(new pcl::search::KdTree<pcl::PointXYZ>);
@@ -753,7 +794,6 @@ private:
       }
     }
 
-
     const double weed_radius = this->get_parameter("weed_radius").as_double();
     const double weed_zrel_min = this->get_parameter("weed_zrel_min").as_double();
 
@@ -763,7 +803,7 @@ private:
       for(const auto& wp : weed_cloud_local->points){
         if(!std::isfinite(wp.x) || !std::isfinite(wp.y) || !std::isfinite(wp.z)) continue;
 
-        // weed点が「地面から浮いてる」ものだけセルマーク（地面点が混ざる場合の保険）
+        // weed点が「地面から浮いてる」ものだけセルマーク
         float gz;
         bool ok_gz = lookup_ground_z_from_cells(
           (double)wp.x, (double)wp.y, cells, bx, by, cell_size, ref_R, flat_ref_deg_max, gz);
@@ -820,7 +860,7 @@ private:
       // 最終weed候補（半径10cm OR weedセル）
       bool weed_candidate = (is_weed_near || is_weed_cell);
 
-      // 地面高さ gz を近傍セルから借りて計算 -> zrel
+      // 地面高さ gz を近傍セルから借りて計算 zrel
       bool weed_ok_height = false;
       if(weed_candidate){
         float gz;
@@ -847,7 +887,7 @@ private:
         is_big_obs   = c.big_obs;
       }
 
-      // --- colorize all points ---
+      // colored all points
       if(is_ground){
         p_all.r = 0; p_all.g = 255; p_all.b = 0;         // ground green
       }
@@ -855,13 +895,13 @@ private:
         p_all.r = 0; p_all.g = 0; p_all.b = 255;         // weed blue
       }
       else if(is_cylinder){
-        p_all.r = 255; p_all.g = 0; p_all.b = 0;     // cylinder pink
+        p_all.r = 255; p_all.g = 0; p_all.b = 0;     // cylinder red
       }
       else if(is_slope){
-        p_all.r = 255; p_all.g = 0; p_all.b = 255;       // slope cyan
+        p_all.r = 255; p_all.g = 0; p_all.b = 255;       // slope purple
       }
       else if(is_small_obs){
-        p_all.r = 255; p_all.g = 140; p_all.b = 0;       // step yellow
+        p_all.r = 255; p_all.g = 140; p_all.b = 0;       // step orange
       }
       else if(is_big_obs){
         p_all.r = 255; p_all.g = 0; p_all.b = 0;         // obstacle red
@@ -872,7 +912,7 @@ private:
       }
       colored->points.push_back(p_all);
 
-      // ground_set points -> red, else white
+      //地面点の表示
       if(is_ground_point){
         p_ground.r = 255; p_ground.g = 0;   p_ground.b = 0;
       }else{
@@ -880,7 +920,7 @@ private:
       }
       ground->points.push_back(p_ground);
 
-      // cylinder points -> red, else white
+      //円柱表示
       if(is_cylinder){
         p_cyl.r = 255; p_cyl.g = 0; p_cyl.b = 0;
       }else{
@@ -889,7 +929,7 @@ private:
       cylinder->points.push_back(p_cyl);
     }
 
-    // cell_ground: representative ground plane z at cell center (use n_ground/d_ground)
+    //cell_groundで出力する用
     pcl::PointCloud<pcl::PointXYZ>::Ptr cell_ground_cloud(new pcl::PointCloud<pcl::PointXYZ>());
     cell_ground_cloud->points.reserve(cells.size());
 
@@ -944,18 +984,8 @@ private:
     pub_unknown_->publish(msg_ng);
     pub_cylinder_->publish(msg_cy);
 
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-      "map=%zu cand=%zu clusters=%zu ground_set=%zu out_ground=%zu",
-      cloud_map->points.size(),
-      cand_cloud->points.size(),
-      cluster_indices.size(),
-      ground_set.size(),
-      ground->points.size());
   }
 
-  // ==========================================================
-  // helpers
-  // ==========================================================
   pcl::PointCloud<pcl::PointXYZ>::Ptr voxel_downsample(const pcl::PointCloud<pcl::PointXYZ>::Ptr& input, double vx)
   {
     pcl::VoxelGrid<pcl::PointXYZ> voxel;
@@ -1090,6 +1120,7 @@ private:
     query.x = xc; query.y = yc; query.z = 0.0f;
     std::vector<int> idx;
     std::vector<float> dist2;
+
     if(kdtree->radiusSearch(query, roi_radius, idx, dist2) <= 0){
       return false;
     }
@@ -1116,23 +1147,25 @@ private:
     ne.setSearchMethod(tree_roi);
     ne.setKSearch(normal_k);
 
+    //推定した法線をnormalsに格納
     pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
     ne.compute(*normals);
 
-    // NOTE:
-    // PCL環境によっては SACSegmentationFromNormals が sac_segmentation.h 内にあります。
-    // もし環境で見つからない場合は、PCLのインストール/ヘッダ構成を確認してください。
     pcl::SACSegmentationFromNormals<pcl::PointXYZ, pcl::Normal> seg;
     seg.setOptimizeCoefficients(true);
     seg.setModelType(pcl::SACMODEL_CYLINDER);
     seg.setMethodType(pcl::SAC_RANSAC);
+    //実際の法線の向きとモデルの理想的な法線と一致しているかをどれだけ重視するか決定。0.1は法線を重視しておらず距離だけ
     seg.setNormalDistanceWeight(0.1);
+    //RANSACの反復回数。
     seg.setMaxIterations(200);
+    //円柱モデルからどれくらい離れていても許容するか[m]
     seg.setDistanceThreshold(dist_thresh);
     seg.setRadiusLimits(radius_min, radius_max);
     seg.setInputCloud(roi);
     seg.setInputNormals(normals);
 
+    //円柱モデルに一致した点の集合
     pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
     pcl::ModelCoefficients::Ptr coeff(new pcl::ModelCoefficients);
     seg.segment(*inliers, *coeff);
@@ -1159,11 +1192,10 @@ private:
         weed_kdtree_->setInputCloud(weed_cloud_);
       }
     }
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                       "weed cloud updated: pts=%zu", wf->points.size());
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "weed cloud updated: pts=%zu", wf->points.size());
   }
 
-  // NOTE: ここは「地面平面」として c.n_ground/c.d_ground を使う（新方針の代表法線）
+  //ここは地面平面として c.n_ground/c.d_ground を使う
   bool lookup_ground_z_from_cells(double x, double y,
                                   const std::map<std::pair<int,int>, Cell>& cells,
                                   double bx, double by, double cell_size,
@@ -1186,52 +1218,20 @@ private:
 
     const int ref_range = std::max(1, (int)std::ceil(ref_R / cell_size));
 
-    auto search_nearest_ground_plane =
-      [&](bool require_flat, Eigen::Vector3f& n_ref, float& d_ref) -> bool
-    {
-      bool found = false;
-      float best_dist = std::numeric_limits<float>::infinity();
-
-      for(int dy=-ref_range; dy<=ref_range; ++dy){
-        for(int dx=-ref_range; dx<=ref_range; ++dx){
-          auto it = cells.find({ix + dx, iy + dy});
-          if(it == cells.end()) continue;
-          const Cell& nb = it->second;
-          if(!nb.has_ground_plane) continue;
-
-          double dist = std::sqrt((double)(dx*dx + dy*dy)) * cell_size;
-          if(dist > ref_R) continue;
-
-          if(require_flat){
-            double tilt = angle_deg(nb.n_ground, z_axis);
-            if(tilt > flat_ref_deg_max) continue;
-          }
-
-          if((float)dist < best_dist){
-            best_dist = (float)dist;
-            n_ref = nb.n_ground;
-            d_ref = nb.d_ground;
-            found = true;
-          }
-        }
-      }
-      return found;
-    };
-
-    // 1) 最寄り（斜面OK）
+    // 最寄り
     {
       Eigen::Vector3f n_ref = z_axis;
       float d_ref = 0.0f;
-      if(search_nearest_ground_plane(false, n_ref, d_ref)){
+      if(search_nearest_ground_plane(cells, ix, iy, ref_range, cell_size, ref_R, false, flat_ref_deg_max, n_ref, d_ref)){
         return plane_z_at_xy(n_ref, d_ref, (float)x, (float)y, gz_out);
       }
     }
 
-    // 2) flatのみ（保険）
+    // 2) flatのみ
     {
       Eigen::Vector3f n_ref = z_axis;
       float d_ref = 0.0f;
-      if(search_nearest_ground_plane(true, n_ref, d_ref)){
+      if(search_nearest_ground_plane(cells, ix, iy, ref_range, cell_size, ref_R, true, flat_ref_deg_max, n_ref, d_ref)){
         return plane_z_at_xy(n_ref, d_ref, (float)x, (float)y, gz_out);
       }
     }
